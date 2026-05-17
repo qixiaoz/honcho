@@ -225,21 +225,20 @@ async def check_and_schedule_dream(
     dream may be enqueued for the same (workspace, observer, observed) — and the
     baseline count advances only when consolidation actually happened.
 
-    Check if a collection has reached the explicit-observation threshold and schedule a timer-based dream.
+    Check if a collection has reached the explicit-observation threshold and enqueue a dream task.
 
-    This function only schedules a timer-based dream if:
+    This function only enqueues a dream if:
     1. Dreams are enabled
     2. Explicit-observation threshold is reached (dreamer output does not count)
     3. Minimum hours between dreams have passed
     4. No dream is already pending in the queue for this collection (in-flight check)
-    5. No dream is already scheduled for this collection
 
     Args:
         db: Database session
         collection: Collection model to check
 
     Returns:
-        True if a dream timer was scheduled, False otherwise
+        True if a dream was enqueued, False otherwise
     """
     if not settings.DREAM.ENABLED:
         return False
@@ -326,37 +325,39 @@ async def check_and_schedule_dream(
             )
             return False
 
-        dream_scheduler = get_dream_scheduler()
-        if dream_scheduler:
-            for dream_type in enabled_dream_types:
-                dream_work_unit_key = construct_work_unit_key(
-                    collection.workspace_name,
-                    {
-                        "task_type": "dream",
-                        "observer": collection.observer,
-                        "observed": collection.observed,
-                        "dream_type": dream_type,
-                    },
-                )
-                await dream_scheduler.schedule_dream(
-                    dream_work_unit_key,
-                    collection.workspace_name,
-                    settings.DREAM.IDLE_TIMEOUT_MINUTES,
-                    dream_type=DreamType(dream_type),
-                    observer=collection.observer,
-                    observed=collection.observed,
-                )
-                logger.debug(
-                    "Scheduled dream",
-                    extra={
-                        "workspace_name": collection.workspace_name,
-                        "observer": collection.observer,
-                        "observed": collection.observed,
-                        "documents_since_last_dream": documents_since_last_dream,
-                        "document_threshold": settings.DREAM.DOCUMENT_THRESHOLD,
-                        "dream_type": dream_type,
-                    },
-                )
-            return True
+        # Run the dream check in-process: enqueue directly instead of routing
+        # through a DreamScheduler singleton that only exists in the Deriver
+        # process. The in-flight dedup (line 310, above) prevents duplicates.
+        for dream_type in enabled_dream_types:
+            dream_work_unit_key = construct_work_unit_key(
+                collection.workspace_name,
+                {
+                    "task_type": "dream",
+                    "observer": collection.observer,
+                    "observed": collection.observed,
+                    "dream_type": dream_type,
+                },
+            )
+            # Lazy import to avoid circular deps at module level
+            from src.deriver.enqueue import enqueue_dream as _enqueue_dream
+
+            await _enqueue_dream(
+                collection.workspace_name,
+                observer=collection.observer,
+                observed=collection.observed,
+                dream_type=DreamType(dream_type),
+            )
+            logger.info(
+                "Auto-enqueued dream",
+                extra={
+                    "workspace_name": collection.workspace_name,
+                    "observer": collection.observer,
+                    "observed": collection.observed,
+                    "documents_since_last_dream": documents_since_last_dream,
+                    "document_threshold": settings.DREAM.DOCUMENT_THRESHOLD,
+                    "dream_type": dream_type,
+                },
+            )
+        return True
 
     return False
