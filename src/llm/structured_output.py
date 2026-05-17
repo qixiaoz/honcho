@@ -35,6 +35,19 @@ def repair_response_model_json(
 
         if (
             response_model is PromptRepresentation
+            and "explicit" in repaired_data
+            and isinstance(repaired_data["explicit"], list)
+        ):
+            # Normalize string-form observations to object form
+            # Prompt tells LLM: {"explicit": ["obs1", "obs2"]}
+            # But schema expects: {"explicit": [{"content": "obs1"}, {"content": "obs2"}]}
+            repaired_data["explicit"] = [
+                {"content": item} if isinstance(item, str) else item
+                for item in repaired_data["explicit"]
+            ]
+
+        if (
+            response_model is PromptRepresentation
             and "deductive" in repaired_data
             and isinstance(repaired_data["deductive"], list)
         ):

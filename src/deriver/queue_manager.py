@@ -378,6 +378,7 @@ class QueueManager:
                 try:
                     await self.cleanup_stale_work_units()
                     claimed_work_units = await self.get_and_claim_work_units()
+                    logger.debug("Poll: claimed %d work units: %s", len(claimed_work_units), list(claimed_work_units.keys()))
                     if claimed_work_units:
                         for work_unit_key, aqs_id in claimed_work_units.items():
                             # Create a new task for processing this work unit
@@ -449,7 +450,7 @@ class QueueManager:
 
     async def process_work_unit(self, work_unit_key: str, worker_id: str) -> None:
         """Process all queue items for a specific work unit by routing to the correct handler."""
-        logger.debug(f"Starting to process work unit {work_unit_key}")
+        logger.debug("Starting to process work unit %s", work_unit_key)
         work_unit = parse_work_unit_key(work_unit_key)
         async with self.semaphore:
             queue_item_count = 0
@@ -475,9 +476,7 @@ class QueueManager:
                                 f"Worker {worker_id} retrieved {len(messages_context)} messages and {len(items_to_process)} queue items for work unit {work_unit_key} (AQS ID: {ownership.aqs_id})"
                             )
                             if not items_to_process:
-                                logger.debug(
-                                    f"No more queue items to process for work unit {work_unit_key} for worker {worker_id}"
-                                )
+                                logger.debug("No more queue items to process for work unit %s", work_unit_key)
                                 break
 
                             try:

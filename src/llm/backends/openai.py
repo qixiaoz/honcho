@@ -162,10 +162,16 @@ class OpenAIBackend:
                     content_override=content,
                 )
             except (BadRequestError, json.JSONDecodeError, ValidationError):
-                fallback_response = await self._create_structured_response(
-                    params=params,
-                    response_format=response_format,
-                )
+                try:
+                    fallback_response = await self._create_structured_response(
+                        params=params,
+                        response_format=response_format,
+                    )
+                except BadRequestError:
+                    # DeepSeek fallback: json_object instead of json_schema
+                    no_format_params = dict(params)
+                    no_format_params["response_format"] = {"type": "json_object"}
+                    fallback_response = await self._client.chat.completions.create(**no_format_params)
                 content = self._parse_or_repair_structured_content(
                     fallback_response,
                     response_format,

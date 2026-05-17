@@ -1481,11 +1481,7 @@ async def _handle_search_memory(ctx: ToolContext, tool_input: dict[str, Any]) ->
     mem = Representation.from_documents(documents)
     total_count = mem.len()
     if total_count == 0:
-        # fallback behavior: if the memory is *empty*, that means we're quite
-        # early in a workspace/peer/session -- in order to give good answers in
-        # this stage, and be efficient with tool calls, and make sure the model
-        # doesn't short-circuit and think there's nothing here, we
-        # automatically search the message history for relevant information.
+        # fallback behavior: if the memory is *empty*, find data from other sources.
         if ctx.agent_type == "dialectic":
             limit = min(_safe_int(tool_input.get("top_k"), 20), 20)
             message_output = None
@@ -1510,6 +1506,26 @@ async def _handle_search_memory(ctx: ToolContext, tool_input: dict[str, Any]) ->
                 f"No observations found for query '{query}', and no messages found in "
                 "history. Try a different phrasing or use grep_messages for exact text."
             )
+        if ctx.agent_type in ("deduction", "induction"):
+            # Dream specialists need observations to reason about. Fall back to
+            # recent observations (direct DB query, bypasses vector store).
+            limit = min(_safe_int(tool_input.get("top_k"), 20), 20)
+            async with tracked_db("tool.search_memory.dream_fallback") as db:
+                recent = await crud.query_documents_recent(
+                    db=db,
+                    workspace_name=ctx.workspace_name,
+                    observer=ctx.observer,
+                    observed=ctx.observed,
+                    limit=limit,
+                )
+                if recent:
+                    mem = Representation.from_documents(recent)
+                    repr_str = mem.str_with_ids() if ctx.include_observation_ids else str(mem)
+                    return (
+                        f"No vector search results for query '{query}', "
+                        f"but found {len(recent)} recent observations:\n\n{repr_str}"
+                    )
+            return f"No observations found for query '{query}'"
         return f"No observations found for query '{query}'"
     mem_str = mem.str_with_ids() if ctx.include_observation_ids else str(mem)
     return f"Found {total_count} observations for query '{query}':\n\n{mem_str}"

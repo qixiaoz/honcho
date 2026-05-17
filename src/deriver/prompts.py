@@ -59,6 +59,10 @@ Analyze messages from {peer_id} to extract **explicit atomic facts** about them.
    - Each conclusion must be self-contained with enough context
    - Use absolute dates/times when possible (e.g. "June 26, 2025" not "yesterday")
 
+OUTPUT FORMAT: Your response MUST be a valid JSON object with an "explicit" array containing strings.
+EXAMPLE JSON OUTPUT:
+{{"explicit": ["Observation 1 about the user with full context", "Observation 2 about the user with full context"]}}
+
 RULES:
 - Properly attribute observations to the correct subject: if it is about {peer_id}, say so. If {peer_id} is referencing someone or something else, make that clear.
 - Observations should make sense on their own. Each observation will be used in the future to better understand {peer_id}.
