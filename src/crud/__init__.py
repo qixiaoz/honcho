@@ -34,6 +34,7 @@ from .message import (
     update_message,
 )
 from .peer import (
+    delete_peer,
     get_or_create_peers,
     get_peer,
     get_peers,
