@@ -129,6 +129,19 @@ class WorkspaceConfiguration(BaseModel):
         description="Configuration for dream functionality. If reasoning is disabled, dreams will also be disabled and these settings will be ignored.",
     )
 
+    allowed_ai_peers: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional allowlist of peer names that may be auto-created in this workspace. "
+            "When set to a non-empty list, requests to create a new peer in this workspace "
+            "(via /v3/workspaces/{ws}/peers or /v3/workspaces/{ws}/sessions/{s}/peers) "
+            "whose name is not in this list will be rejected with 422. Already-existing peers "
+            "are always permitted regardless of this list, so re-adding a peer to a session "
+            "is never blocked. When null, missing, or an empty list, peer auto-creation is "
+            "unrestricted (the default behavior). Useful for guarding against cross-workspace "
+            "peer leakage where one profile's AI peer gets sent to another workspace's session."
+        ),
+    )
 
 class SessionConfiguration(WorkspaceConfiguration):
     """

@@ -52,6 +52,49 @@ class ValidationException(HonchoException):
 
 
 @final
+class PeerNotAllowedException(HonchoException):
+    """Raised when peer auto-creation is gated by the workspace's
+    ``allowed_ai_peers`` configuration and a request asks to create a new peer
+    whose name is not on the allowlist. Already-existing peers are never
+    affected by this guardrail.
+    """
+
+    status_code = 422
+
+    def __init__(
+        self,
+        workspace_name: str,
+        rejected: list[str],
+        allowed: list[str] | None,
+    ):
+        # `allowed` should never be None/empty here (the gating code only
+        # raises when an allowlist was actually configured and at least one
+        # name failed it), but be defensive in case the exception is reused.
+        if allowed:
+            allowed_str = ", ".join(sorted(allowed))
+            rejected_str = ", ".join(sorted(rejected))
+            detail = (
+                f"Workspace '{workspace_name}' restricts new peer "
+                f"auto-creation to: [{allowed_str}]. "
+                f"Rejected peer name(s): [{rejected_str}]. "
+                f"To allow these peers, add them to the workspace's "
+                f"configuration.allowed_ai_peers list, or create the peer "
+                f"out-of-band first (peer records survive across allowlist "
+                f"changes)."
+            )
+        else:
+            rejected_str = ", ".join(sorted(rejected))
+            detail = (
+                f"Workspace '{workspace_name}' rejected peer "
+                f"auto-creation for: [{rejected_str}]."
+            )
+        super().__init__(detail)
+        self.workspace_name = workspace_name
+        self.rejected = rejected
+        self.allowed = allowed
+
+
+@final
 class ConflictException(HonchoException):
     """Exception raised when there's a resource conflict."""
 

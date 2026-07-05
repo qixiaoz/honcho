@@ -13,7 +13,11 @@ from src import models, schemas
 from src.cache.client import cache, get_cache_namespace, safe_cache_delete
 from src.config import settings
 from src.crud.workspace import get_or_create_workspace
-from src.exceptions import ConflictException, ResourceNotFoundException
+from src.exceptions import (
+    ConflictException,
+    PeerNotAllowedException,
+    ResourceNotFoundException,
+)
 from src.models import Peer
 from src.utils.filter import apply_filter
 from src.utils.types import GetOrCreateResult
@@ -60,7 +64,20 @@ async def get_or_create_peers(
         ConflictException: If we fail to get or create the peers
     """
 
-    await get_or_create_workspace(db, schemas.WorkspaceCreate(name=workspace_name))
+    ws_result = await get_or_create_workspace(
+        db, schemas.WorkspaceCreate(name=workspace_name)
+    )
+    # ``allowed_ai_peers`` is the workspace-level allowlist for peer
+    # auto-creation. When set to a non-empty list, any new peer name not in
+    # the list will be rejected here so cross-workspace leaks (e.g. an
+    # OpenCode plugin sending one profile's AI peer into another profile's
+    # workspace) cannot silently grow a workspace's peer roster.
+    allowed_ai_peers: list[str] | None = None
+    if ws_result.resource is not None:
+        ws_config = ws_result.resource.configuration or {}
+        raw_allowed = ws_config.get("allowed_ai_peers")
+        if isinstance(raw_allowed, list):
+            allowed_ai_peers = [str(x) for x in raw_allowed if isinstance(x, (str, int))]
     peer_names = [p.name for p in peers]
     stmt = (
         select(models.Peer)
@@ -103,6 +120,18 @@ async def get_or_create_peers(
     # Find which peers need to be created
     existing_names = {p.name for p in existing_peers}
     peers_to_create = [p for p in peers if p.name not in existing_names]
+
+    # Allowlist gate: if the workspace has a non-empty ``allowed_ai_peers``
+    # configured, reject any peer name not on it BEFORE we touch the DB.
+    # Empty list / None means "unrestricted" (current behavior preserved).
+    if allowed_ai_peers and peers_to_create:
+        rejected = [p.name for p in peers_to_create if p.name not in allowed_ai_peers]
+        if rejected:
+            raise PeerNotAllowedException(
+                workspace_name=workspace_name,
+                rejected=rejected,
+                allowed=allowed_ai_peers,
+            )
 
     # Create new peers
     new_peers = [
