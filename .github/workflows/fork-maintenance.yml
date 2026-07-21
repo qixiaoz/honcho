@@ -1,0 +1,296 @@
+name: Maintain fork patch stack
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * *"
+      timezone: "America/Los_Angeles"
+
+concurrency:
+  group: fork-maintenance
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  TARGET_BRANCH: "custom"
+  UPSTREAM_URL: "https://github.com/plastic-labs/honcho.git"
+  UPSTREAM_BRANCH: "main"
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout maintained branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Inspect upstream and audit state
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "fork-maintenance[bot]"
+          git config user.email "fork-maintenance[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git fetch --no-tags origin \
+            "+refs/heads/maintenance/upstream-base:refs/remotes/origin/maintenance/upstream-base" \
+            || true
+          git fetch --no-tags origin \
+            "+refs/heads/maintenance/audited-head:refs/remotes/origin/maintenance/audited-head" \
+            || true
+
+          original_head="$(git rev-parse HEAD)"
+          upstream_ref="upstream/$UPSTREAM_BRANCH"
+          upstream_head="$(git rev-parse "$upstream_ref")"
+          workflow_blob="$(git rev-parse "$original_head:.github/workflows/fork-maintenance.yml")"
+          state_upstream="$(git rev-parse --verify refs/remotes/origin/maintenance/upstream-base 2>/dev/null || true)"
+          state_audited="$(git rev-parse --verify refs/remotes/origin/maintenance/audited-head 2>/dev/null || true)"
+          reasons=()
+
+          [[ "$state_upstream" == "$upstream_head" ]] || reasons+=("upstream changed or first run")
+          [[ "$state_audited" == "$original_head" ]] || reasons+=("local patch stack changed or first run")
+          git merge-base --is-ancestor "$upstream_ref" HEAD || reasons+=("upstream tip is not an ancestor")
+          if git rev-list --merges "$upstream_ref"..HEAD | grep -q .; then
+            reasons+=("merge commits exist above upstream")
+          fi
+          if git cherry "$upstream_ref" HEAD | grep -q '^-'; then
+            reasons+=("upstream-equivalent patches still exist")
+          fi
+
+          if (( ${#reasons[@]} == 0 )); then
+            needs_update=false
+          else
+            needs_update=true
+          fi
+          reason="$(IFS='; '; echo "${reasons[*]:-none}")"
+
+          {
+            echo "needs_update=$needs_update"
+            echo "original_head=$original_head"
+            echo "upstream_head=$upstream_head"
+            echo "upstream_ref=$upstream_ref"
+            echo "workflow_blob=$workflow_blob"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Fork maintenance preflight"
+            echo "- Target: \`$TARGET_BRANCH@$original_head\`"
+            echo "- Upstream: \`$upstream_ref@$upstream_head\`"
+            echo "- Agent run required: \`$needs_update\`"
+            echo "- Reason: $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save pre-rewrite backup
+        if: steps.preflight.outputs.needs_update == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_HEAD: ${{ steps.preflight.outputs.original_head }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$remote" "$ORIGINAL_HEAD:refs/heads/maintenance/backup" --force
+
+      - name: Require Codex API credential
+        if: steps.preflight.outputs.needs_update == 'true'
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo "::error::Add an OPENAI_API_KEY Actions secret before enabling fork maintenance."
+            exit 1
+          fi
+
+      - name: Rebuild and audit the patch stack
+        id: codex
+        if: steps.preflight.outputs.needs_update == 'true'
+        uses: openai/codex-action@v1
+        env:
+          FORK_MAINTENANCE_ORIGINAL_HEAD: ${{ steps.preflight.outputs.original_head }}
+          FORK_MAINTENANCE_UPSTREAM_REF: ${{ steps.preflight.outputs.upstream_ref }}
+          FORK_MAINTENANCE_UPSTREAM_HEAD: ${{ steps.preflight.outputs.upstream_head }}
+          FORK_MAINTENANCE_TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          FORK_MAINTENANCE_WORKFLOW_BLOB: ${{ steps.preflight.outputs.workflow_blob }}
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          effort: high
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+          output-file: codex-output.md
+          prompt: |
+            You are the semantic maintainer of a long-lived fork. Read the
+            FORK_MAINTENANCE_* environment variables with the shell before doing
+            anything; their values are authoritative.
+
+            Rebuild the checked-out maintained branch as a clean, linear patch
+            stack rooted directly at the exact fetched official upstream tip.
+            Do not merely merge upstream.
+
+            Required policy:
+            1. Every fork-only commit must be above the upstream tip.
+            2. If upstream already implements the same behavior or fix, drop the
+               fork patch instead of retaining a duplicate.
+            3. If upstream changes conflict with a fork feature, adapt the fork
+               implementation to the current upstream architecture while
+               preserving the feature's observable behavior.
+            4. Each functional feature or fix must map to exactly one commit.
+               Combine scattered commits for the same topic; split mixed commits.
+               Keep code, tests, and directly related docs for one topic together.
+            5. Use specific conventional-style subjects such as feat(scope): ...,
+               fix(scope): ..., refactor(scope): ..., or chore(scope): ....
+            6. Preserve .github/workflows/fork-maintenance.yml byte-for-byte from
+               the original head, and keep it in one atomic maintenance commit.
+               Recover it with git show after any reset.
+
+            Work method:
+            - First read AGENTS.md and repository contributor/build instructions.
+            - Treat old commit messages as clues, not ground truth. Inspect the
+              old history, net diff, tests, and current upstream implementation
+              with git log, git diff, git cherry, and git range-diff where useful.
+            - Enumerate every distinct fork behavior before rewriting history.
+            - Prove an absorbed feature from current upstream code and tests before
+              dropping it.
+            - Reconstruct the branch from the fetched upstream ref rather than
+              preserving historical merge commits.
+            - Resolve conflicts semantically; never choose ours/theirs blindly.
+            - Add or update focused tests when adaptation changes implementation.
+            - Run the repository's relevant formatter, lint/type checks, targeted
+              tests, and a practical broader test command documented by the repo.
+            - Review the final diff and every commit one more time for atomicity,
+              duplication, accidental deletions, and behavior regressions.
+
+            Hard constraints:
+            - The exact upstream tip must be an ancestor of HEAD.
+            - No merge, empty, fixup, squash, or WIP commits above upstream.
+            - No upstream-equivalent patch may remain.
+            - Leave the target branch checked out with a clean worktree.
+            - Do not push, edit remote refs, alter this workflow file, weaken
+              tests, or disable functionality.
+            - Your final response must list kept, modified, merged/split, and
+              dropped topics, the final commit subjects, and all tests run.
+
+      - name: Record Codex report
+        if: steps.preflight.outputs.needs_update == 'true' && always()
+        shell: bash
+        run: |
+          if [[ -f codex-output.md ]]; then
+            {
+              echo "### Codex maintenance report"
+              cat codex-output.md
+            } >> "$GITHUB_STEP_SUMMARY"
+            rm -f codex-output.md
+          fi
+
+      - name: Verify rewritten history
+        if: steps.preflight.outputs.needs_update == 'true'
+        shell: bash
+        env:
+          UPSTREAM_REF: ${{ steps.preflight.outputs.upstream_ref }}
+          UPSTREAM_HEAD: ${{ steps.preflight.outputs.upstream_head }}
+          WORKFLOW_BLOB: ${{ steps.preflight.outputs.workflow_blob }}
+        run: |
+          set -euo pipefail
+          [[ "$(git symbolic-ref --short HEAD)" == "$TARGET_BRANCH" ]]
+          git diff --quiet
+          git diff --cached --quiet
+          git merge-base --is-ancestor "$UPSTREAM_REF" HEAD
+          [[ "$(git merge-base HEAD "$UPSTREAM_REF")" == "$UPSTREAM_HEAD" ]]
+          [[ -z "$(git rev-list --merges "$UPSTREAM_REF"..HEAD)" ]]
+          ! git cherry "$UPSTREAM_REF" HEAD | grep -q '^-'
+          [[ "$(git rev-parse "HEAD:.github/workflows/fork-maintenance.yml")" == "$WORKFLOW_BLOB" ]]
+
+          while read -r commit; do
+            [[ -n "$commit" ]] || continue
+            parent="$(git rev-parse "$commit^")"
+            if git diff-tree --quiet "$parent" "$commit"; then
+              echo "::error::Empty commit: $commit"
+              exit 1
+            fi
+            subject="$(git show -s --format=%s "$commit")"
+            if [[ -z "$subject" || "$subject" == Merge* || "$subject" == WIP* || "$subject" == fixup\!* || "$subject" == squash\!* ]]; then
+              echo "::error::Unclear or temporary commit subject: $subject"
+              exit 1
+            fi
+          done < <(git rev-list --reverse "$UPSTREAM_REF"..HEAD)
+
+      - name: Publish maintained branch and audit refs
+        if: steps.preflight.outputs.needs_update == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_HEAD: ${{ steps.preflight.outputs.original_head }}
+          UPSTREAM_HEAD: ${{ steps.preflight.outputs.upstream_head }}
+        run: |
+          set -euo pipefail
+          new_head="$(git rev-parse HEAD)"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$remote" "HEAD:refs/heads/$TARGET_BRANCH" \
+            --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIGINAL_HEAD"
+          git push "$remote" "$UPSTREAM_HEAD:refs/heads/maintenance/upstream-base" --force
+          git push "$remote" "$new_head:refs/heads/maintenance/audited-head" --force
+          echo "Updated \`$TARGET_BRANCH\` to \`$new_head\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update maintenance failure issue
+        if: failure() && steps.preflight.outputs.needs_update == 'true'
+        uses: actions/github-script@v7
+        env:
+          PREFLIGHT_REASON: ${{ steps.preflight.outputs.reason }}
+        with:
+          script: |
+            const title = "[fork-maintenance] needs attention";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              "The scheduled upstream refresh could not safely publish a rewritten patch stack.",
+              "",
+              `- Run: ${runUrl}`,
+              `- Target branch: \`${process.env.TARGET_BRANCH}\``,
+              `- Reason for refresh: ${process.env.PREFLIGHT_REASON || "see workflow log"}`,
+              "",
+              "The previous branch tip is preserved at `maintenance/backup`."
+            ].join("\n");
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const found = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
+            const issue = found.data.items.find(item => item.title === title);
+            if (issue) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body
+              });
+            }
+
+      - name: Close stale maintenance failure issue
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "[fork-maintenance] needs attention";
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const found = await github.rest.search.issuesAndPullRequests({ q, per_page: 10 });
+            for (const item of found.data.items.filter(item => item.title === title)) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: item.number,
+                state: "closed"
+              });
+            }
