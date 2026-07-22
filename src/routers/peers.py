@@ -129,6 +129,46 @@ async def update_peer(
     return updated_peer
 
 
+@router.delete(
+    "/{peer_id}",
+    status_code=202,
+    dependencies=[
+        Depends(require_auth(workspace_name="workspace_id", peer_name="peer_id"))
+    ],
+)
+async def delete_peer(
+    workspace_id: str = Path(...),
+    peer_id: str = Path(...),
+    db: AsyncSession = db,
+):
+    """
+    Delete a Peer and all associated data from a Workspace.
+
+    Cascades the deletion across messages, message embeddings, observations
+    (documents), collections, session memberships, and any queue items
+    referencing the peer's messages. External vector store namespaces for
+    affected collections are also cleared on a best-effort basis.
+
+    Returns 202 Accepted with a summary of the cascade counts. The actual
+    deletion is performed synchronously in a single transaction; the 202
+    status mirrors the existing session-deletion pattern for consistency.
+
+    This action cannot be undone. Deleting a peer that is an observer or
+    observed in a mixed collection (e.g. TheHerta ↔ HertaDocsWriter) will
+    also remove the other peer's observations about the deleted peer,
+    because Honcho's collection key is (observer, observed, workspace)
+    and observations cannot be partially deleted.
+    """
+    result = await crud.delete_peer(db, workspace_name=workspace_id, peer_name=peer_id)
+    return {
+        "peer": peer_id,
+        "workspace": workspace_id,
+        "messages_deleted": result.messages_deleted,
+        "documents_deleted": result.documents_deleted,
+        "collections_deleted": result.collections_deleted,
+    }
+
+
 @router.post(
     "/{peer_id}/sessions",
     response_model=Page[schemas.Session],

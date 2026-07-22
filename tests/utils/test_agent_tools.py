@@ -835,7 +835,6 @@ class TestSearchMemory:
         assert len(fallback_embeddings) == 1
         assert query_embeddings[0] == fallback_embeddings[0]
 
-
     async def test_dream_specialist_falls_back_to_recent_observations(
         self,
         tool_test_data: Any,
@@ -857,9 +856,7 @@ class TestSearchMemory:
         ) -> list[models.Document]:
             return documents[:2]
 
-        monkeypatch.setattr(
-            "src.utils.agent_tools.embedding_client.embed", fake_embed
-        )
+        monkeypatch.setattr("src.utils.agent_tools.embedding_client.embed", fake_embed)
         monkeypatch.setattr(
             "src.utils.agent_tools.crud.query_documents", fake_query_documents
         )
