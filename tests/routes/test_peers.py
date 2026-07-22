@@ -1382,3 +1382,28 @@ def test_chat_with_invalid_response_format(
     assert response.status_code == 422
     assert "Invalid response_format" in response.json()["detail"]
     mock_llm_call_functions["agentic_chat"].assert_not_awaited()
+
+
+def test_delete_peer_endpoint(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    workspace, _ = sample_data
+    peer_name = f"delete-peer-{generate_nanoid()}"
+    created = client.post(
+        f"/v3/workspaces/{workspace.name}/peers",
+        json={"name": peer_name},
+    )
+    assert created.status_code in [200, 201]
+
+    deleted = client.delete(
+        f"/v3/workspaces/{workspace.name}/peers/{peer_name}"
+    )
+    assert deleted.status_code == 202
+    payload = deleted.json()
+    assert payload["peer"] == peer_name
+    assert payload["workspace"] == workspace.name
+
+    deleted_again = client.delete(
+        f"/v3/workspaces/{workspace.name}/peers/{peer_name}"
+    )
+    assert deleted_again.status_code == 404
