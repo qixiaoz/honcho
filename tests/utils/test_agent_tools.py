@@ -836,6 +836,49 @@ class TestSearchMemory:
         assert query_embeddings[0] == fallback_embeddings[0]
 
 
+    async def test_dream_specialist_falls_back_to_recent_observations(
+        self,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Dream specialists use recent observations when vector search is empty."""
+        *_, documents = tool_test_data
+        ctx = make_tool_context(agent_type="deduction")
+
+        async def fake_embed(_query: str) -> list[float]:
+            return [0.1, 0.2, 0.3]
+
+        async def fake_query_documents(**_kwargs: Any) -> list[models.Document]:
+            return []
+
+        async def fake_query_documents_recent(
+            **_kwargs: Any,
+        ) -> list[models.Document]:
+            return documents[:2]
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.embed", fake_embed
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.query_documents", fake_query_documents
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.query_documents_recent",
+            fake_query_documents_recent,
+        )
+
+        result = await _handle_search_memory(
+            ctx, {"query": "recent preferences", "top_k": 2}
+        )
+
+        from src.utils.types import ToolResult
+
+        assert isinstance(result, ToolResult)
+        assert "found 2 recent observations" in result.content
+        assert result.metadata["results_count"] == 2
+
+
 @pytest.mark.asyncio
 class TestSearchMessages:
     """Tests for _handle_search_messages."""
