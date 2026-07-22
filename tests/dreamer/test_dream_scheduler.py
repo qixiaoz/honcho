@@ -387,13 +387,14 @@ class TestThresholdFilter:
             await self._insert_doc(db_session, collection, "explicit")
         await db_session.commit()
 
-        with patch.object(
-            dream_scheduler, "schedule_dream", new_callable=AsyncMock
-        ) as mock_schedule:
+        DreamScheduler.reset_singleton()
+        with patch(
+            "src.deriver.enqueue.enqueue_dream", new_callable=AsyncMock
+        ) as mock_enqueue:
             scheduled = await check_and_schedule_dream(db_session, collection)
 
         assert scheduled is True
-        assert mock_schedule.called, "schedule_dream should fire when threshold met"
+        assert mock_enqueue.await_count == 1
 
     @pytest.mark.asyncio
     async def test_contradiction_excluded_from_count(
