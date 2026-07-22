@@ -1817,6 +1817,32 @@ async def _handle_search_memory(
                 ),
                 metadata=zero_hit_meta,
             )
+        if ctx.agent_type in ("deduction", "induction"):
+            limit = min(_safe_int(tool_input.get("top_k"), 20), 20)
+            async with tracked_db(
+                "tool.search_memory.dream_fallback", read_only=True
+            ) as db:
+                recent = await crud.query_documents_recent(
+                    db=db,
+                    workspace_name=ctx.workspace_name,
+                    observer=ctx.observer,
+                    observed=ctx.observed,
+                    limit=limit,
+                )
+            if recent:
+                recent_mem = Representation.from_documents(recent)
+                recent_str = (
+                    recent_mem.str_with_ids()
+                    if ctx.include_observation_ids
+                    else str(recent_mem)
+                )
+                return ToolResult(
+                    content=(
+                        f"No vector search results for query '{query}', but found "
+                        f"{len(recent)} recent observations:\n\n{recent_str}"
+                    ),
+                    metadata={**zero_hit_meta, "results_count": len(recent)},
+                )
         return ToolResult(
             content=f"No observations found for query '{query}'",
             metadata=zero_hit_meta,
