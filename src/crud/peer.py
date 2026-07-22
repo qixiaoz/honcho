@@ -2,9 +2,11 @@
 
 from logging import getLogger
 from typing import Any
+from typing import cast as typing_cast
 
 from cashews import NOT_NONE
-from sqlalchemy import Select, select
+from sqlalchemy import Select, delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import make_transient_to_detached
@@ -325,3 +327,223 @@ async def get_sessions_for_peer(
         stmt = stmt.order_by(models.Session.created_at.asc(), models.Session.id.asc())
 
     return stmt
+
+
+class PeerDeletionResult:
+    """Result of a peer deletion operation.
+
+    Mirrors the structure of WorkspaceDeletionResult for consistency.
+    """
+
+    def __init__(
+        self,
+        peer_name: str,
+        messages_deleted: int = 0,
+        documents_deleted: int = 0,
+        collections_deleted: int = 0,
+    ):
+        self.peer_name: str = peer_name
+        self.messages_deleted: int = messages_deleted
+        self.documents_deleted: int = documents_deleted
+        self.collections_deleted: int = collections_deleted
+
+
+async def delete_peer(
+    db: AsyncSession,
+    workspace_name: str,
+    peer_name: str,
+) -> PeerDeletionResult:
+    """Delete a peer and all associated data from a workspace.
+
+    Cascades the deletion across:
+      - queue items referencing the peer's messages
+      - message embeddings for the peer
+      - documents (observations) in any collection involving the peer
+      - collections where the peer is either observer or observed
+      - messages sent by the peer
+      - session_peers memberships for the peer
+      - the peer row itself
+
+    Also clears external vector store namespaces for any document
+    collection that is solely scoped to this peer (so we don't leave
+    stale vectors for collections the other side still has).
+
+    Note: any collection that involved this peer and ANOTHER active peer
+    is also removed in full (along with all of its documents). This is
+    because Honcho's collection key is (observer, observed, workspace)
+    and there is no way to partially delete observations from a
+    collection without changing the data model. Callers that need to
+    preserve the other peer's observations should re-create the peer
+    under a different name first, or accept the loss.
+
+    Args:
+        db: Database session
+        workspace_name: Name of the workspace
+        peer_name: Name of the peer to delete
+
+    Returns:
+        PeerDeletionResult with counts of deleted data
+
+    Raises:
+        ResourceNotFoundException: if the peer does not exist
+    """
+    # Verify peer exists
+    await get_peer(
+        db,
+        workspace_name=workspace_name,
+        peer=schemas.PeerCreate(name=peer_name),
+    )
+
+    result = PeerDeletionResult(peer_name=peer_name)
+
+    try:
+        # 1) Capture collection list BEFORE deleting documents (we need
+        #    (observer, observed) to clean up vector store namespaces)
+        collections_result = await db.execute(
+            select(models.Collection).where(
+                models.Collection.workspace_name == workspace_name,
+                (models.Collection.observer == peer_name)
+                | (models.Collection.observed == peer_name),
+            )
+        )
+        collections = collections_result.scalars().all()
+
+        # 2) Delete QueueItem rows that reference messages owned by this
+        #    peer. queue.message_id has no ON DELETE CASCADE so this must
+        #    happen before messages are removed.
+        message_id_subquery = select(models.Message.id).where(
+            models.Message.workspace_name == workspace_name,
+            models.Message.peer_name == peer_name,
+        )
+        queue_result = typing_cast(
+            CursorResult[Any],
+            await db.execute(
+                delete(models.QueueItem).where(
+                    models.QueueItem.message_id.in_(message_id_subquery)
+                )
+            ),
+        )
+        logger.debug(
+            "Deleted %d queue items referencing peer %s messages",
+            queue_result.rowcount,
+            peer_name,
+        )
+
+        # 3) Message embeddings (FK to peers, no CASCADE)
+        await db.execute(
+            delete(models.MessageEmbedding).where(
+                models.MessageEmbedding.workspace_name == workspace_name,
+                models.MessageEmbedding.peer_name == peer_name,
+            )
+        )
+
+        # 4) Documents in any collection involving the peer
+        #    (must happen before collections because of FK ordering)
+        docs_result = typing_cast(
+            CursorResult[Any],
+            await db.execute(
+                delete(models.Document).where(
+                    models.Document.workspace_name == workspace_name,
+                    (models.Document.observer == peer_name)
+                    | (models.Document.observed == peer_name),
+                )
+            ),
+        )
+        result.documents_deleted = docs_result.rowcount or 0
+
+        # 5) Collections where the peer is observer or observed
+        coll_result = typing_cast(
+            CursorResult[Any],
+            await db.execute(
+                delete(models.Collection).where(
+                    models.Collection.workspace_name == workspace_name,
+                    (models.Collection.observer == peer_name)
+                    | (models.Collection.observed == peer_name),
+                )
+            ),
+        )
+        result.collections_deleted = coll_result.rowcount or 0
+
+        # 6) Messages sent by the peer
+        msgs_result = typing_cast(
+            CursorResult[Any],
+            await db.execute(
+                delete(models.Message).where(
+                    models.Message.workspace_name == workspace_name,
+                    models.Message.peer_name == peer_name,
+                )
+            ),
+        )
+        result.messages_deleted = msgs_result.rowcount or 0
+
+        # 7) Session memberships
+        await db.execute(
+            delete(models.SessionPeer).where(
+                models.SessionPeer.workspace_name == workspace_name,
+                models.SessionPeer.peer_name == peer_name,
+            )
+        )
+
+        # 8) Finally the peer row itself
+        await db.execute(
+            delete(models.Peer).where(
+                models.Peer.workspace_name == workspace_name,
+                models.Peer.name == peer_name,
+            )
+        )
+
+        await db.commit()
+
+    except Exception:
+        logger.exception("Failed to delete peer %s/%s", workspace_name, peer_name)
+        await db.rollback()
+        raise
+
+    # 9) Best-effort vector store cleanup. Done after commit so a vector
+    #    store failure doesn't roll back the DB deletion. Each collection
+    #    we deleted had a per-(observer, observed) document namespace.
+    try:
+        from src.vector_store import get_external_vector_store
+
+        external_vector_store = get_external_vector_store()
+        if external_vector_store:
+            for collection in collections:
+                doc_namespace = external_vector_store.get_vector_namespace(
+                    "document",
+                    workspace_name,
+                    collection.observer,
+                    collection.observed,
+                )
+                try:
+                    await external_vector_store.delete_namespace(doc_namespace)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to delete document namespace %s for peer %s: %s",
+                        doc_namespace,
+                        peer_name,
+                        e,
+                    )
+    except ImportError:
+        # vector store optional in some deployments
+        pass
+
+    # 10) Invalidate caches
+    try:
+        await safe_cache_delete(peer_cache_key(workspace_name, peer_name))
+        # Also invalidate any per-peer caches that might exist
+        workspace_pattern = f"{get_cache_namespace()}:workspace:{workspace_name}:*"
+        await cache.delete_match(workspace_pattern)
+    except Exception as e:
+        logger.warning(
+            "Cache invalidation failed after deleting peer %s: %s", peer_name, e
+        )
+
+    logger.info(
+        "Deleted peer %s/%s: %d messages, %d documents, %d collections",
+        workspace_name,
+        peer_name,
+        result.messages_deleted,
+        result.documents_deleted,
+        result.collections_deleted,
+    )
+    return result

@@ -35,6 +35,7 @@ from .message import (
     update_message,
 )
 from .peer import (
+    delete_peer,
     get_or_create_peers,
     get_peer,
     get_peers,
@@ -112,6 +113,7 @@ __all__ = [
     "search_messages_temporal",
     "update_message",
     # Peer
+    "delete_peer",
     "get_or_create_peers",
     "get_peer",
     "get_peers",
