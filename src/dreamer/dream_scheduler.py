@@ -254,21 +254,23 @@ async def check_and_schedule_dream(
     dream may be enqueued for the same (workspace, observer, observed) — and the
     baseline count advances only when consolidation actually happened.
 
-    Check if a collection has reached the explicit-observation threshold and schedule a timer-based dream.
+    Check if a collection has reached the explicit-observation threshold and
+    schedule it through the local DreamScheduler. If this code is running in a
+    process without the scheduler singleton, enqueue the dream directly as a
+    cross-process fallback.
 
-    This function only schedules a timer-based dream if:
+    This function accepts a dream if:
     1. Dreams are enabled
     2. Explicit-observation threshold is reached (dreamer output does not count)
     3. Minimum hours between dreams have passed
     4. No dream is already pending in the queue for this collection (in-flight check)
-    5. No dream is already scheduled for this collection
 
     Args:
         db: Database session
         collection: Collection model to check
 
     Returns:
-        True if a dream timer was scheduled, False otherwise
+        True if a dream was accepted by the scheduler or fallback queue, False otherwise
     """
     if not settings.DREAM.ENABLED:
         return False
@@ -402,5 +404,35 @@ async def check_and_schedule_dream(
                     },
                 )
             return True
+
+        # Threshold checks may run in a process that does not own the local
+        # DreamScheduler singleton. Preserve the custom cross-process behavior by
+        # enqueueing immediately only in that case. The pending queue uniqueness
+        # check above remains the durable deduplication boundary.
+        from src.deriver.enqueue import enqueue_dream
+
+        for dream_type in enabled_dream_types:
+            await enqueue_dream(
+                collection.workspace_name,
+                observer=collection.observer,
+                observed=collection.observed,
+                dream_type=DreamType(dream_type),
+                trigger_reason=trigger_reason,
+                delay_reason=delay_reason,
+                documents_since_last_dream_at_schedule=documents_since_last_dream,
+                document_threshold=settings.DREAM.DOCUMENT_THRESHOLD,
+            )
+            logger.info(
+                "Auto-enqueued dream without local scheduler",
+                extra={
+                    "workspace_name": collection.workspace_name,
+                    "observer": collection.observer,
+                    "observed": collection.observed,
+                    "documents_since_last_dream": documents_since_last_dream,
+                    "document_threshold": settings.DREAM.DOCUMENT_THRESHOLD,
+                    "dream_type": dream_type,
+                },
+            )
+        return True
 
     return False

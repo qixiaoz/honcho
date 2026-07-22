@@ -396,6 +396,35 @@ class TestThresholdFilter:
         assert mock_schedule.called, "schedule_dream should fire when threshold met"
 
     @pytest.mark.asyncio
+    async def test_explicit_threshold_enqueues_without_local_scheduler(
+        self,
+        dream_scheduler: DreamScheduler,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """A worker without the scheduler singleton must still enqueue the dream."""
+        collection = await self._make_collection(db_session, sample_data)
+        for _ in range(60):
+            await self._insert_doc(db_session, collection, "explicit")
+        await db_session.commit()
+
+        with (
+            patch("src.dreamer.dream_scheduler._dream_scheduler", None),
+            patch(
+                "src.deriver.enqueue.enqueue_dream", new_callable=AsyncMock
+            ) as mock_enqueue,
+        ):
+            scheduled = await check_and_schedule_dream(db_session, collection)
+
+        assert scheduled is True
+        mock_enqueue.assert_awaited_once()
+        assert mock_enqueue.await_args is not None
+        assert mock_enqueue.await_args.args == (collection.workspace_name,)
+        assert mock_enqueue.await_args.kwargs["observer"] == collection.observer
+        assert mock_enqueue.await_args.kwargs["observed"] == collection.observed
+        assert mock_enqueue.await_args.kwargs["dream_type"] is DreamType.OMNI
+
+    @pytest.mark.asyncio
     async def test_contradiction_excluded_from_count(
         self,
         dream_scheduler: DreamScheduler,
