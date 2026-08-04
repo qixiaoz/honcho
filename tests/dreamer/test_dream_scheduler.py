@@ -10,6 +10,7 @@ from src import models
 from src.dreamer.dream_scheduler import (
     DreamScheduler,
     check_and_schedule_dream,
+    get_dream_scheduler,
     set_dream_scheduler,
 )
 from src.schemas import DreamType
@@ -403,6 +404,7 @@ class TestThresholdFilter:
         sample_data: tuple[models.Workspace, models.Peer],
     ):
         """A worker without the scheduler singleton must still enqueue the dream."""
+        assert get_dream_scheduler() is dream_scheduler
         collection = await self._make_collection(db_session, sample_data)
         for _ in range(60):
             await self._insert_doc(db_session, collection, "explicit")
