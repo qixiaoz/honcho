@@ -1,0 +1,99 @@
+name: Agent rebuild Honcho custom commits
+
+on:
+  pull_request:
+    branches:
+      - agent/fix-dream-scheduler-fallback-20260804
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-and-amend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/format-honcho-custom-20260804
+          fetch-depth: 0
+
+      - name: Amend scheduler regression and republish candidate
+        shell: bash
+        env:
+          OLD_CANDIDATE: 583d6a08d0dec5f3d089eb96959bfb030c47757b
+          UPSTREAM_SHA: 148f646796067bf7da9c7b7121a21cd47f86039e
+          CUSTOM_COMMIT_1: 9613403
+          CUSTOM_COMMIT_2: ce011d8
+          CUSTOM_COMMIT_3: 583d6a08d0dec5f3d089eb96959bfb030c47757b
+          TARGET_BRANCH: agent/fix-dream-scheduler-fallback-20260804
+        run: |
+          set -euxo pipefail
+          git config user.name "OpenAI Maintenance Agent"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/plastic-labs/honcho.git
+          git fetch --no-tags upstream main
+          test "$(git rev-parse upstream/main)" = "${UPSTREAM_SHA}"
+          test "$(git rev-parse origin/${TARGET_BRANCH})" = "${OLD_CANDIDATE}"
+
+          git checkout --detach "${UPSTREAM_SHA}"
+          git cherry-pick "${CUSTOM_COMMIT_1}"
+          git cherry-pick "${CUSTOM_COMMIT_2}"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/dreamer/test_dream_scheduler.py")
+          text = path.read_text()
+
+          old_import = """from src.dreamer.dream_scheduler import (
+    DreamScheduler,
+    check_and_schedule_dream,
+    set_dream_scheduler,
+)
+"""
+          new_import = """from src.dreamer.dream_scheduler import (
+    DreamScheduler,
+    check_and_schedule_dream,
+    get_dream_scheduler,
+    set_dream_scheduler,
+)
+"""
+          if text.count(old_import) != 1:
+              raise SystemExit("dream scheduler import target did not match exactly once")
+          text = text.replace(old_import, new_import)
+
+          old_body = """    ):
+        \"\"\"A worker without the scheduler singleton must still enqueue the dream.\"\"\"
+        collection = await self._make_collection(db_session, sample_data)
+"""
+          new_body = """    ):
+        \"\"\"A worker without the scheduler singleton must still enqueue the dream.\"\"\"
+        assert get_dream_scheduler() is dream_scheduler
+        collection = await self._make_collection(db_session, sample_data)
+"""
+          if text.count(old_body) != 1:
+              raise SystemExit("fallback regression target did not match exactly once")
+          path.write_text(text.replace(old_body, new_body))
+          PY
+
+          git add tests/dreamer/test_dream_scheduler.py
+          git commit --amend --no-edit
+          git cherry-pick "${CUSTOM_COMMIT_3}"
+
+          new_candidate="$(git rev-parse HEAD)"
+          test "$(git merge-base HEAD upstream/main)" = "${UPSTREAM_SHA}"
+          test "$(git rev-list --count upstream/main..HEAD)" = "3"
+          test "$(git rev-list --merges --count upstream/main..HEAD)" = "0"
+          test ! -e .github/workflows/agent-rebuild-honcho-custom.yml
+          test ! -e .github/workflows/agent-validate-honcho-scheduler.yml
+          test ! -e .github/workflows/agent-format-honcho-custom.yml
+          test ! -e .github/workflows/agent-diagnose-dream-scheduler.yml
+          test ! -e .github/agent-rebuild-honcho.sh
+          git diff --check upstream/main..HEAD
+          git log --oneline --reverse upstream/main..HEAD
+          git diff --stat upstream/main..HEAD
+
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${OLD_CANDIDATE}" \
+            origin "${new_candidate}:refs/heads/${TARGET_BRANCH}"
+          echo "NEW_CANDIDATE=${new_candidate}"
