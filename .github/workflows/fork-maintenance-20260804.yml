@@ -1,0 +1,212 @@
+name: Honcho custom fork maintenance 2026-08-04
+
+on:
+  pull_request:
+    branches: [custom]
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: honcho-fork-maintenance-20260804
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/plastic-labs/honcho.git
+  UPSTREAM_SHA: 148f646796067bf7da9c7b7121a21cd47f86039e
+  ORIGINAL_HEAD: abdff701ab574f0dd50c81cf75d47cda8939c88a
+  ORIGINAL_MERGE_BASE: 4d3ab1c36b4f805af02db3ef1feb1a049efe422f
+  TARGET_BRANCH: custom
+  MAINT_BRANCH: fork-maintenance/honcho-auto-20260804
+  CUSTOM_COUNT: '3'
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      database:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Audit patch stack and rebase without edits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main --no-tags
+
+          start_upstream=$(git rev-parse upstream/main)
+          start_fork=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          merge_base=$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")
+          printf 'START_UPSTREAM=%s\nSTART_FORK=%s\nMERGE_BASE=%s\n' "$start_upstream" "$start_fork" "$merge_base"
+          test "$start_upstream" = "$UPSTREAM_SHA"
+          test "$start_fork" = "$ORIGINAL_HEAD"
+          test "$merge_base" = "$ORIGINAL_MERGE_BASE"
+
+          mapfile -t original_commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
+          test "${#original_commits[@]}" = "$CUSTOM_COUNT"
+          : > /tmp/original-subjects
+          : > /tmp/original-patchids
+          for commit in "${original_commits[@]}"; do
+            subject=$(git show -s --format='%s' "$commit")
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$subject"
+            printf '%s\n' "$subject" >> /tmp/original-subjects
+            printf '%s\n' "$patch_id" >> /tmp/original-patchids
+          done
+
+          echo '=== git cherry audit ==='
+          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
+          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
+          if grep -q '^-' /tmp/cherry; then
+            echo 'At least one custom patch is already present upstream; semantic review required.'
+            exit 21
+          fi
+
+          git checkout -B maintenance-candidate "$ORIGINAL_HEAD"
+          set +e
+          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
+          rebase_rc=$?
+          set -e
+          if [ "$rebase_rc" -ne 0 ]; then
+            echo "REBASE_EXIT_CODE=$rebase_rc"
+            echo '=== conflicting files ==='
+            git diff --name-only --diff-filter=U || true
+            echo '=== status ==='
+            git status --short || true
+            echo '=== stopped commit ==='
+            git rebase --show-current-patch || true
+            git rebase --abort || true
+            exit 22
+          fi
+
+          candidate=$(git rev-parse HEAD)
+          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges "$UPSTREAM_SHA..$candidate" | wc -l)" = 0
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$candidate"
+
+          : > /tmp/candidate-subjects
+          : > /tmp/candidate-patchids
+          while read -r commit; do
+            subject=$(git show -s --format='%s' "$commit")
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$subject"
+            printf '%s\n' "$subject" >> /tmp/candidate-subjects
+            printf '%s\n' "$patch_id" >> /tmp/candidate-patchids
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
+          diff -u /tmp/original-subjects /tmp/candidate-subjects
+          diff -u /tmp/original-patchids /tmp/candidate-patchids
+          git diff --check "$UPSTREAM_SHA..$candidate"
+          echo '=== range-diff ==='
+          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
+          echo "CANDIDATE_SHA=$candidate" | tee -a "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Ruff and BasedPyright
+        run: |
+          set -Eeuo pipefail
+          uv run ruff check .
+          uv run basedpyright
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: TypeScript install, lint, typecheck, and build
+        working-directory: sdks/typescript
+        run: |
+          set -Eeuo pipefail
+          bun install --frozen-lockfile
+          bun run lint
+          bun run typecheck
+          bun run build
+
+      - name: Run pytest suite
+        env:
+          DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@localhost:5432/test_db
+          AUTH_USE_AUTH: 'false'
+          SENTRY_ENABLED: 'false'
+          LLM_OPENAI_API_KEY: ''
+          LLM_ANTHROPIC_API_KEY: ''
+          LLM_OPENAI_COMPATIBLE_API_KEY: test-key
+          LLM_OPENAI_COMPATIBLE_BASE_URL: http://localhost:8000
+          DERIVER_PROVIDER: openai
+          DERIVER_MODEL: test
+          DIALECTIC_LEVELS__minimal__PROVIDER: openai
+          DIALECTIC_LEVELS__minimal__MODEL: test
+          DIALECTIC_LEVELS__minimal__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS: '2'
+          DIALECTIC_LEVELS__low__PROVIDER: openai
+          DIALECTIC_LEVELS__low__MODEL: test
+          DIALECTIC_LEVELS__low__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__low__MAX_TOOL_ITERATIONS: '5'
+          DIALECTIC_LEVELS__medium__PROVIDER: openai
+          DIALECTIC_LEVELS__medium__MODEL: test
+          DIALECTIC_LEVELS__medium__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__medium__MAX_TOOL_ITERATIONS: '4'
+          DIALECTIC_LEVELS__high__PROVIDER: openai
+          DIALECTIC_LEVELS__high__MODEL: test
+          DIALECTIC_LEVELS__high__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__high__MAX_TOOL_ITERATIONS: '4'
+          DIALECTIC_LEVELS__max__PROVIDER: openai
+          DIALECTIC_LEVELS__max__MODEL: test
+          DIALECTIC_LEVELS__max__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__max__MAX_TOOL_ITERATIONS: '10'
+          DIALECTIC_QUERY_GENERATION_PROVIDER: openai
+          DIALECTIC_QUERY_GENERATION_MODEL: test
+          SUMMARY_PROVIDER: openai
+          SUMMARY_MODEL: test
+        run: uv run pytest -x
+
+      - name: Build Python package
+        run: uv build
+
+      - name: Recheck refs and publish with exact lease
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          end_upstream=$(git ls-remote upstream refs/heads/main | awk '{print $1}')
+          remote_target=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          printf 'END_UPSTREAM=%s\nREMOTE_TARGET_BEFORE=%s\nCANDIDATE_SHA=%s\n' "$end_upstream" "$remote_target" "$CANDIDATE_SHA"
+          test "$end_upstream" = "$UPSTREAM_SHA"
+          test "$remote_target" = "$ORIGINAL_HEAD"
+          git push --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIGINAL_HEAD" origin "$CANDIDATE_SHA:refs/heads/$TARGET_BRANCH"
+          remote_after=$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')
+          test "$remote_after" = "$CANDIDATE_SHA"
+          echo "REMOTE_TARGET_AFTER=$remote_after"
+
+      - name: Remove temporary maintenance branch
+        if: always()
+        shell: bash
+        run: git push origin --delete "$MAINT_BRANCH" || true
