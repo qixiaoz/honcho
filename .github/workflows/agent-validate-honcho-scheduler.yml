@@ -1,82 +1,29 @@
-name: Agent validate Honcho custom repair
+name: Agent clean Honcho maintenance refs
 
 on:
   pull_request:
     branches:
-      - agent/fix-dream-scheduler-fallback-20260804
+      - custom
 
 permissions:
-  contents: read
-
-concurrency:
-  group: agent-validate-honcho-custom-20260804
-  cancel-in-progress: false
-
-env:
-  CANDIDATE_SHA: 7fa117803df5fc49dc4e8ae59dba9206bcd66d72
-  UPSTREAM_SHA: 148f646796067bf7da9c7b7121a21cd47f86039e
-  DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@localhost:5432/test_db
-  AUTH_USE_AUTH: false
-  SENTRY_ENABLED: false
-  LLM_OPENAI_API_KEY: test-key
-  LLM_ANTHROPIC_API_KEY: test-key
-  LLM_OPENAI_COMPATIBLE_API_KEY: test-key
-  LLM_OPENAI_COMPATIBLE_BASE_URL: http://localhost:8000
-  DERIVER_PROVIDER: openai
-  DERIVER_MODEL: test
-  DIALECTIC_LEVELS__minimal__PROVIDER: openai
-  DIALECTIC_LEVELS__minimal__MODEL: test
-  DIALECTIC_LEVELS__minimal__THINKING_BUDGET_TOKENS: 0
-  DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS: 2
-  DIALECTIC_LEVELS__low__PROVIDER: openai
-  DIALECTIC_LEVELS__low__MODEL: test
-  DIALECTIC_LEVELS__low__THINKING_BUDGET_TOKENS: 0
-  DIALECTIC_LEVELS__low__MAX_TOOL_ITERATIONS: 5
-  DIALECTIC_LEVELS__medium__PROVIDER: openai
-  DIALECTIC_LEVELS__medium__MODEL: test
-  DIALECTIC_LEVELS__medium__THINKING_BUDGET_TOKENS: 0
-  DIALECTIC_LEVELS__medium__MAX_TOOL_ITERATIONS: 4
-  DIALECTIC_LEVELS__high__PROVIDER: openai
-  DIALECTIC_LEVELS__high__MODEL: test
-  DIALECTIC_LEVELS__high__THINKING_BUDGET_TOKENS: 0
-  DIALECTIC_LEVELS__high__MAX_TOOL_ITERATIONS: 4
-  DIALECTIC_LEVELS__max__PROVIDER: openai
-  DIALECTIC_LEVELS__max__MODEL: test
-  DIALECTIC_LEVELS__max__THINKING_BUDGET_TOKENS: 0
-  DIALECTIC_LEVELS__max__MAX_TOOL_ITERATIONS: 10
-  DIALECTIC_QUERY_GENERATION_PROVIDER: openai
-  DIALECTIC_QUERY_GENERATION_MODEL: test
-  SUMMARY_PROVIDER: openai
-  SUMMARY_MODEL: test
+  contents: write
 
 jobs:
-  validate:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    services:
-      database:
-        image: pgvector/pgvector:pg15
-        env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 10
     steps:
-      - name: Check out exact candidate
+      - name: Check out published custom branch
         uses: actions/checkout@v4
         with:
-          ref: 7fa117803df5fc49dc4e8ae59dba9206bcd66d72
+          ref: custom
           fetch-depth: 0
 
-      - name: Verify topology and scope
+      - name: Verify publication and delete temporary branches
         shell: bash
+        env:
+          CANDIDATE_SHA: 7fa117803df5fc49dc4e8ae59dba9206bcd66d72
+          UPSTREAM_SHA: 148f646796067bf7da9c7b7121a21cd47f86039e
         run: |
           set -euxo pipefail
           test "$(git rev-parse HEAD)" = "${CANDIDATE_SHA}"
@@ -86,65 +33,11 @@ jobs:
           test "$(git merge-base HEAD upstream/main)" = "${UPSTREAM_SHA}"
           test "$(git rev-list --count upstream/main..HEAD)" = "4"
           test "$(git rev-list --merges --count upstream/main..HEAD)" = "0"
-          test ! -e .github/workflows/agent-validate-honcho-scheduler.yml
-          test ! -e .github/workflows/agent-rebuild-honcho-custom.yml
-          test ! -e .github/workflows/agent-format-honcho-custom.yml
-          test ! -e .github/workflows/agent-diagnose-dream-scheduler.yml
-          test ! -e .github/agent-rebuild-honcho.sh
-          git diff --check upstream/main..HEAD
-          git log --oneline --reverse upstream/main..HEAD
-          git diff --stat upstream/main..HEAD
 
-      - uses: astral-sh/setup-uv@v2
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          git push origin --delete \
+            agent/fix-dream-scheduler-fallback-20260804 \
+            agent/format-honcho-custom-20260804 \
+            agent/rebuild-base-20260804 \
+            agent/validate-honcho-scheduler-20260804
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version-file: pyproject.toml
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install TypeScript SDK dependencies
-        working-directory: sdks/typescript
-        run: bun install
-
-      - name: Install project
-        run: uv sync --all-extras --dev
-
-      - name: Focused dream regressions
-        run: uv run pytest -q tests/dreamer/test_dream_scheduler.py tests/dreamer/test_dreamer_integration.py
-
-      - name: Ruff lint on custom files
-        run: >-
-          uv run ruff check
-          src/crud/__init__.py
-          src/crud/peer.py
-          src/dreamer/dream_scheduler.py
-          src/routers/peers.py
-          src/utils/agent_tools.py
-          tests/dreamer/test_dream_scheduler.py
-          tests/routes/test_peers.py
-          tests/utils/test_agent_tools.py
-
-      - name: Ruff format on custom files
-        run: >-
-          uv run ruff format --check
-          src/crud/__init__.py
-          src/crud/peer.py
-          src/dreamer/dream_scheduler.py
-          src/routers/peers.py
-          src/utils/agent_tools.py
-          tests/dreamer/test_dream_scheduler.py
-          tests/routes/test_peers.py
-          tests/utils/test_agent_tools.py
-
-      - name: BasedPyright
-        run: uv run basedpyright
-
-      - name: Full Python suite
-        run: uv run pytest -x -q
-
-      - name: Confirm candidate
-        run: echo "Validated ${CANDIDATE_SHA} against ${UPSTREAM_SHA}"
+          echo "Temporary Honcho maintenance branches deleted"
