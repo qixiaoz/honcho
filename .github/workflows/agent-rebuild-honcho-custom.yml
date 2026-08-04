@@ -1,9 +1,13 @@
 name: Agent rebuild Honcho custom commits
 
 on:
+  push:
+    branches:
+      - agent/format-honcho-custom-20260804
   pull_request:
     branches:
       - agent/fix-dream-scheduler-fallback-20260804
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
