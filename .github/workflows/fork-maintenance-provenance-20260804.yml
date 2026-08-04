@@ -1,0 +1,244 @@
+name: Honcho provenance-aware fork maintenance 2026-08-04
+
+on:
+  pull_request:
+    branches: [custom]
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_URL: https://github.com/plastic-labs/honcho.git
+  UPSTREAM_SHA: 148f646796067bf7da9c7b7121a21cd47f86039e
+  ORIGINAL_HEAD: abdff701ab574f0dd50c81cf75d47cda8939c88a
+  ORIGINAL_MERGE_BASE: 4d3ab1c36b4f805af02db3ef1feb1a049efe422f
+  TARGET_BRANCH: custom
+  MAINT_BRANCH: fork-maintenance/honcho-provenance-20260804-1028
+  CUSTOM_COUNT: '3'
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    services:
+      database:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Audit and replay exact patch stack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'qixiaoz-maintenance[bot]'
+          git config user.email 'qixiaoz-maintenance[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git ls-remote origin refs/heads/$TARGET_BRANCH | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          test "$(git merge-base "$ORIGINAL_HEAD" "$UPSTREAM_SHA")" = "$ORIGINAL_MERGE_BASE"
+
+          mapfile -t commits < <(git rev-list --reverse "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD")
+          test "${#commits[@]}" = "$CUSTOM_COUNT"
+          : > /tmp/original-subjects
+          : > /tmp/original-patchids
+          for commit in "${commits[@]}"; do
+            subject=$(git show -s --format='%s' "$commit")
+            patch_id=$(git show "$commit" | git patch-id --stable | awk '{print $1}')
+            printf '%s %s %s\n' "$commit" "$patch_id" "$subject"
+            printf '%s\n' "$subject" >> /tmp/original-subjects
+            printf '%s\n' "$patch_id" >> /tmp/original-patchids
+          done
+          git cherry -v "$UPSTREAM_SHA" "$ORIGINAL_HEAD" | tee /tmp/cherry
+          test "$(wc -l < /tmp/cherry)" = "$CUSTOM_COUNT"
+          ! grep -q '^-' /tmp/cherry
+
+          git checkout -B maintenance-candidate "$ORIGINAL_HEAD"
+          set +e
+          git rebase --onto "$UPSTREAM_SHA" "$ORIGINAL_MERGE_BASE"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "REBASE_EXIT_CODE=$rc"
+            git diff --name-only --diff-filter=U || true
+            git status --short || true
+            git rebase --show-current-patch || true
+            git rebase --abort || true
+            exit 22
+          fi
+
+          candidate=$(git rev-parse HEAD)
+          test "$(git merge-base "$UPSTREAM_SHA" "$candidate")" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA..$candidate")" = "$CUSTOM_COUNT"
+          test "$(git rev-list --merges "$UPSTREAM_SHA..$candidate" | wc -l)" = 0
+          : > /tmp/candidate-subjects
+          : > /tmp/candidate-patchids
+          while read -r commit; do
+            git show -s --format='%s' "$commit" >> /tmp/candidate-subjects
+            git show "$commit" | git patch-id --stable | awk '{print $1}' >> /tmp/candidate-patchids
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$candidate")
+          diff -u /tmp/original-subjects /tmp/candidate-subjects
+          diff -u /tmp/original-patchids /tmp/candidate-patchids
+          git range-diff "$ORIGINAL_MERGE_BASE..$ORIGINAL_HEAD" "$UPSTREAM_SHA..$candidate"
+          git diff --check "$UPSTREAM_SHA..$candidate"
+          git diff --name-only "$UPSTREAM_SHA..$candidate" > /tmp/custom-touched-files
+          echo "CANDIDATE_SHA=$candidate" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$candidate"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.1'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Create locked upstream original and candidate environments
+        run: |
+          set -Eeuo pipefail
+          uv python install 3.11
+          git worktree add --detach /tmp/honcho-upstream "$UPSTREAM_SHA"
+          git worktree add --detach /tmp/honcho-original "$ORIGINAL_HEAD"
+          (cd /tmp/honcho-upstream && uv sync --locked --all-extras --dev --python 3.11)
+          (cd /tmp/honcho-original && uv sync --locked --all-extras --dev --python 3.11)
+          (cd "$GITHUB_WORKSPACE" && uv sync --locked --all-extras --dev --python 3.11)
+
+      - name: Native Ruff and provenance differential
+        run: |
+          set -Eeuo pipefail
+          uv run ruff check src/
+          scope=(src tests scripts migrations sdks/python)
+          (cd /tmp/honcho-upstream && uv run ruff check "${scope[@]}" --output-format json --exit-zero > /tmp/ruff-upstream.json)
+          (cd /tmp/honcho-original && uv run ruff check "${scope[@]}" --output-format json --exit-zero > /tmp/ruff-original.json)
+          (cd "$GITHUB_WORKSPACE" && uv run ruff check "${scope[@]}" --output-format json --exit-zero > /tmp/ruff-candidate.json)
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          roots = ['/tmp/honcho-upstream/', '/tmp/honcho-original/', str(Path.cwd()) + '/']
+          def load(path):
+              out = set()
+              for item in json.loads(Path(path).read_text()):
+                  filename = str(item.get('filename', '')).replace('\\', '/')
+                  for root in roots: filename = filename.replace(root, '')
+                  out.add((filename, item.get('code', ''), item.get('message', '')))
+              return out
+          upstream = load('/tmp/ruff-upstream.json')
+          original = load('/tmp/ruff-original.json')
+          candidate = load('/tmp/ruff-candidate.json')
+          new = sorted(candidate - (upstream | original))
+          print(f'ruff upstream={len(upstream)} original={len(original)} candidate={len(candidate)} new={len(new)}')
+          for x in new[:100]: print('NEW', x)
+          if new: raise SystemExit(1)
+          PY
+
+      - name: Three-way BasedPyright provenance gate
+        run: |
+          set -Eeuo pipefail
+          for pair in '/tmp/honcho-upstream:/tmp/pyright-upstream.json' '/tmp/honcho-original:/tmp/pyright-original.json' "$GITHUB_WORKSPACE:/tmp/pyright-candidate.json"; do
+            dir=${pair%%:*}; out=${pair#*:}
+            (cd "$dir" && uv run basedpyright --outputjson > "$out" || test $? -eq 1)
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          roots = ['/tmp/honcho-upstream/', '/tmp/honcho-original/', str(Path.cwd()) + '/']
+          def load(path):
+              out = set()
+              data = json.loads(Path(path).read_text())
+              for item in data.get('generalDiagnostics', []):
+                  filename = str(item.get('file', '')).replace('\\', '/')
+                  for root in roots: filename = filename.replace(root, '')
+                  out.add((filename, item.get('rule', ''), item.get('message', '')))
+              return out
+          upstream = load('/tmp/pyright-upstream.json')
+          original = load('/tmp/pyright-original.json')
+          candidate = load('/tmp/pyright-candidate.json')
+          new = sorted(candidate - (upstream | original))
+          touched = set(Path('/tmp/custom-touched-files').read_text().splitlines())
+          touched_new = [x for x in new if x[0] in touched]
+          print(f'pyright upstream={len(upstream)} original={len(original)} candidate={len(candidate)} new={len(new)} touched-new={len(touched_new)}')
+          for x in new[:100]: print('NEW', x)
+          if new or touched_new: raise SystemExit(1)
+          PY
+
+      - uses: oven-sh/setup-bun@v2
+      - name: TypeScript lint typecheck and build
+        working-directory: sdks/typescript
+        run: |
+          bun install --frozen-lockfile
+          bun run lint
+          bun run typecheck
+          bun run build
+
+      - name: Targeted and full tests
+        env:
+          DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@localhost:5432/test_db
+          AUTH_USE_AUTH: 'false'
+          SENTRY_ENABLED: 'false'
+          LLM_OPENAI_API_KEY: ''
+          LLM_ANTHROPIC_API_KEY: ''
+          LLM_OPENAI_COMPATIBLE_API_KEY: test-key
+          LLM_OPENAI_COMPATIBLE_BASE_URL: http://localhost:8000
+          DERIVER_PROVIDER: openai
+          DERIVER_MODEL: test
+          DIALECTIC_LEVELS__minimal__PROVIDER: openai
+          DIALECTIC_LEVELS__minimal__MODEL: test
+          DIALECTIC_LEVELS__minimal__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS: '2'
+          DIALECTIC_LEVELS__low__PROVIDER: openai
+          DIALECTIC_LEVELS__low__MODEL: test
+          DIALECTIC_LEVELS__low__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__low__MAX_TOOL_ITERATIONS: '5'
+          DIALECTIC_LEVELS__medium__PROVIDER: openai
+          DIALECTIC_LEVELS__medium__MODEL: test
+          DIALECTIC_LEVELS__medium__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__medium__MAX_TOOL_ITERATIONS: '4'
+          DIALECTIC_LEVELS__high__PROVIDER: openai
+          DIALECTIC_LEVELS__high__MODEL: test
+          DIALECTIC_LEVELS__high__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__high__MAX_TOOL_ITERATIONS: '4'
+          DIALECTIC_LEVELS__max__PROVIDER: openai
+          DIALECTIC_LEVELS__max__MODEL: test
+          DIALECTIC_LEVELS__max__THINKING_BUDGET_TOKENS: '0'
+          DIALECTIC_LEVELS__max__MAX_TOOL_ITERATIONS: '10'
+          DIALECTIC_QUERY_GENERATION_PROVIDER: openai
+          DIALECTIC_QUERY_GENERATION_MODEL: test
+          SUMMARY_PROVIDER: openai
+          SUMMARY_MODEL: test
+        run: |
+          set -Eeuo pipefail
+          uv run pytest -x tests/dreamer/test_dream_scheduler.py tests/routes/test_peers.py tests/utils/test_agent_tools.py
+          uv run pytest -x tests/ --ignore=tests/alembic/
+
+      - name: Build Python SDK
+        working-directory: sdks/python
+        run: uv build
+
+      - name: Recheck refs and publish with exact lease
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git fetch upstream main --no-tags
+          test "$(git rev-parse upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git ls-remote origin refs/heads/$TARGET_BRANCH | awk '{print $1}')" = "$ORIGINAL_HEAD"
+          git push --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIGINAL_HEAD" origin "$CANDIDATE_SHA:refs/heads/$TARGET_BRANCH"
+          test "$(git ls-remote origin refs/heads/$TARGET_BRANCH | awk '{print $1}')" = "$CANDIDATE_SHA"
+
+      - name: Remove temporary branch
+        if: always()
+        run: git push origin --delete "$MAINT_BRANCH" || true
