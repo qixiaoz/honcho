@@ -4,7 +4,7 @@ import random
 import signal
 import time
 from asyncio import Task
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
@@ -330,15 +330,19 @@ class QueueManager:
     async def get_and_claim_work_units(self) -> dict[str, str]:
         """
         Get available work units that aren't being processed.
-        For representation tasks, only returns work units with accumulated tokens
-        >= REPRESENTATION_BATCH_MAX_TOKENS (forced batching), unless FLUSH_ENABLED is True.
+        For representation tasks, only returns work units whose accumulated
+        tokens reach REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS or whose
+        oldest pending item exceeds REPRESENTATION_BATCH_MAX_AGE_SECONDS,
+        unless FLUSH_ENABLED is True.
         Returns a dict mapping work_unit_key to aqs_id.
         """
         limit: int = max(0, self.workers - self.get_total_owned_work_units())
         if limit == 0:
             return {}
 
-        batch_max_tokens = settings.DERIVER.REPRESENTATION_BATCH_MAX_TOKENS
+        work_unit_target_tokens = (
+            settings.DERIVER.REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS
+        )
 
         async with tracked_db("get_available_work_units") as db:
             representation_prefix = "representation:"
@@ -346,6 +350,7 @@ class QueueManager:
                 select(
                     models.QueueItem.work_unit_key,
                     func.sum(models.Message.token_count).label("total_tokens"),
+                    func.min(models.QueueItem.created_at).label("oldest_created_at"),
                 )
                 .join(
                     models.Message,
@@ -358,15 +363,21 @@ class QueueManager:
             )
 
             work_units_subq = (
-                select(models.QueueItem.work_unit_key)
+                select(
+                    models.QueueItem.work_unit_key,
+                    func.min(models.QueueItem.created_at).label("oldest_created_at"),
+                )
                 .where(~models.QueueItem.processed)
                 .group_by(models.QueueItem.work_unit_key)
                 .subquery()
             )
 
             query = (
-                select(work_units_subq.c.work_unit_key)
-                .limit(limit)
+                select(
+                    work_units_subq.c.work_unit_key,
+                    token_stats_subq.c.total_tokens,
+                    token_stats_subq.c.oldest_created_at,
+                )
                 .outerjoin(
                     token_stats_subq,
                     work_units_subq.c.work_unit_key == token_stats_subq.c.work_unit_key,
@@ -379,22 +390,53 @@ class QueueManager:
                     )
                     .exists()
                 )
+                .order_by(
+                    work_units_subq.c.oldest_created_at.asc(),
+                    work_units_subq.c.work_unit_key.asc(),
+                )
+                .limit(limit)
             )
 
             # Apply batch threshold filter (skip if FLUSH_ENABLED is True)
-            if not settings.DERIVER.FLUSH_ENABLED and batch_max_tokens > 0:
+            if not settings.DERIVER.FLUSH_ENABLED and work_unit_target_tokens > 0:
+                max_age_seconds = settings.DERIVER.REPRESENTATION_BATCH_MAX_AGE_SECONDS
+                threshold_clause = (
+                    func.coalesce(token_stats_subq.c.total_tokens, 0)
+                    >= work_unit_target_tokens
+                )
+                if max_age_seconds > 0:
+                    threshold_clause = or_(
+                        threshold_clause,
+                        token_stats_subq.c.oldest_created_at
+                        <= func.now() - timedelta(seconds=max_age_seconds),
+                    )
                 query = query.where(
                     or_(
                         ~work_units_subq.c.work_unit_key.startswith(
                             representation_prefix
                         ),
-                        func.coalesce(token_stats_subq.c.total_tokens, 0)
-                        >= batch_max_tokens,
+                        threshold_clause,
                     )
                 )
 
             result = await db.execute(query)
-            available_units = result.scalars().all()
+            available_rows = result.all()
+            available_units: list[str] = []
+            for work_unit_key, total_tokens, oldest_created_at in available_rows:
+                available_units.append(work_unit_key)
+                if (
+                    not settings.DERIVER.FLUSH_ENABLED
+                    and settings.DERIVER.REPRESENTATION_BATCH_MAX_AGE_SECONDS > 0
+                    and work_unit_key.startswith(representation_prefix)
+                    and int(total_tokens or 0) < work_unit_target_tokens
+                ):
+                    logger.info(
+                        "age-flushing work unit %s (tokens=%s < %s, oldest=%s)",
+                        work_unit_key,
+                        total_tokens or 0,
+                        work_unit_target_tokens,
+                        oldest_created_at,
+                    )
             if not available_units:
                 await db.commit()
                 return {}
@@ -433,6 +475,17 @@ class QueueManager:
     def _reset_poll_interval(self) -> None:
         """Snap the polling interval back to the base after finding work."""
         self._current_poll_interval = settings.DERIVER.POLLING_SLEEP_INTERVAL_SECONDS
+
+    @staticmethod
+    def _is_tenant_work(work_unit_keys: Iterable[str]) -> bool:
+        """True if any claimed work unit is real tenant work, not housekeeping."""
+        for key in work_unit_keys:
+            try:
+                if parse_work_unit_key(key).task_type != "reconciler":
+                    return True
+            except ValueError:
+                return True
+        return False
 
     def _jitter(self, seconds: float) -> float:
         """Scatter a sleep by +/- POLLING_JITTER_RATIO to avoid lockstep polling.
@@ -501,7 +554,8 @@ class QueueManager:
                     claimed_work_units = await self.get_and_claim_work_units()
                     logger.debug("Poll: claimed %d work units: %s", len(claimed_work_units), list(claimed_work_units.keys()))
                     if claimed_work_units:
-                        self._reset_poll_interval()
+                        if self._is_tenant_work(claimed_work_units):
+                            self._reset_poll_interval()
                         for work_unit_key, aqs_id in claimed_work_units.items():
                             # Create a new task for processing this work unit
                             if not self.shutdown_event.is_set():
@@ -775,7 +829,7 @@ class QueueManager:
                 f"{task_type} tasks are not supported for get_queue_item_batch"
             )
 
-        batch_max_tokens = settings.DERIVER.REPRESENTATION_BATCH_MAX_TOKENS
+        batch_max_tokens = settings.DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS
         was_flush_enabled = settings.DERIVER.FLUSH_ENABLED
         parsed_key = parse_work_unit_key(work_unit_key)
         messages_context: list[models.Message] = []

@@ -1,7 +1,7 @@
 /**
  * Conclusions Tests
  *
- * Tests for Conclusion operations via ConclusionScope.
+ * Tests for Conclusion operations via ConclusionsView.
  *
  * Endpoints covered:
  * - POST /v3/workspaces/:workspaceId/conclusions (create conclusions)
@@ -11,7 +11,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { Honcho, Conclusion, ConclusionScope } from '../src'
+import { Honcho, Conclusion, ConclusionsView } from '../src'
 import { createTestClient, requireServer } from './setup'
 import { assertConclusionShape } from './helpers'
 
@@ -31,16 +31,16 @@ describe('Conclusions', () => {
   })
 
   // ===========================================================================
-  // ConclusionScope Access
+  // ConclusionsView Access
   // ===========================================================================
 
-  describe('ConclusionScope access', () => {
+  describe('ConclusionsView access', () => {
     test('peer.conclusions returns self-scope', async () => {
       const peer = await client.peer('self-scope-peer')
 
       const scope = peer.conclusions
 
-      expect(scope).toBeInstanceOf(ConclusionScope)
+      expect(scope).toBeInstanceOf(ConclusionsView)
       expect(scope.observer).toBe(peer.id)
       expect(scope.observed).toBe(peer.id)
       expect(scope.workspaceId).toBe(client.workspaceId)
@@ -279,6 +279,61 @@ describe('Conclusions', () => {
   })
 
   // ===========================================================================
+  // Scope-reserved filter guard
+  // ===========================================================================
+
+  describe('reserved filter keys', () => {
+    test('list rejects observer/observed scope keys in filters', async () => {
+      const peer = await client.peer('reserved-list-peer', { metadata: {} })
+
+      for (const key of ['observer', 'observed', 'observer_id', 'observed_id']) {
+        await expect(
+          peer.conclusions.list({ filters: { [key]: 'someone-else' } })
+        ).rejects.toThrow(/managed by this conclusions view/)
+      }
+    })
+
+    test('list rejects session keys in filters (use the session option)', async () => {
+      const peer = await client.peer('reserved-list-session-peer', { metadata: {} })
+
+      await expect(
+        peer.conclusions.list({ filters: { session_id: 'sess' } })
+      ).rejects.toThrow(/managed by this conclusions view/)
+      await expect(
+        peer.conclusions.list({ filters: { session: 'sess' } })
+      ).rejects.toThrow(/managed by this conclusions view/)
+    })
+
+    test('query rejects observer/observed scope keys in filters', async () => {
+      const peer = await client.peer('reserved-query-peer', { metadata: {} })
+
+      for (const key of ['observer', 'observed', 'observer_id', 'observed_id']) {
+        await expect(
+          peer.conclusions.query('q', 10, undefined, { [key]: 'someone-else' })
+        ).rejects.toThrow(/managed by this conclusions view/)
+      }
+    })
+
+    test('query allows session_id in filters (no dedicated session param)', async () => {
+      const peer = await client.peer('reserved-query-session-peer', { metadata: {} })
+
+      // Should not throw the reserved-key guard; session_id is a normal filter
+      // for query. The call may return no matches, which is fine.
+      await expect(
+        peer.conclusions.query('q', 10, undefined, { session_id: 'sess' })
+      ).resolves.toBeDefined()
+    })
+
+    test('non-reserved filters (level) still work on list', async () => {
+      const peer = await client.peer('reserved-allowed-peer', { metadata: {} })
+
+      await expect(
+        peer.conclusions.list({ filters: { level: 'explicit' } })
+      ).resolves.toBeDefined()
+    })
+  })
+
+  // ===========================================================================
   // Conclusion Deletion (DELETE /conclusions/:id)
   // ===========================================================================
 
@@ -409,16 +464,16 @@ describe('Conclusions', () => {
   })
 
   // ===========================================================================
-  // ConclusionScope toString
+  // ConclusionsView toString
   // ===========================================================================
 
-  describe('ConclusionScope toString', () => {
+  describe('ConclusionsView toString', () => {
     test('returns readable format', async () => {
       const peer = await client.peer('scope-tostring-peer')
 
       const str = peer.conclusions.toString()
 
-      expect(str).toContain('ConclusionScope')
+      expect(str).toContain('ConclusionsView')
       expect(str).toContain(peer.id)
       expect(str).toContain(client.workspaceId)
     })

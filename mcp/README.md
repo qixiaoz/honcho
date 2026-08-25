@@ -16,28 +16,21 @@ A Cloudflare Worker that implements the [Model Context Protocol (MCP)](https://m
         "mcp-remote",
         "https://mcp.honcho.dev",
         "--header",
-        "Authorization:${AUTH_HEADER}",
-        "--header",
-        "X-Honcho-User-Name:${USER_NAME}"
+        "Authorization:${AUTH_HEADER}"
       ],
       "env": {
-        "AUTH_HEADER": "Bearer <your-honcho-key>",
-        "USER_NAME": "<your-name>"
+        "AUTH_HEADER": "Bearer <your-honcho-key>"
       }
     }
   }
 }
 ```
 
-### Optional Headers
-
-| Header | Default | Description |
-| --- | --- | --- |
-| `X-Honcho-Workspace-ID` | `"default"` | Workspace to operate in |
+Every workspace-scoped tool takes a `workspace_id` argument. If you set `X-Honcho-Workspace-ID` on the connection, that value fills `workspace_id` when the argument is omitted. Use `list_workspaces` to discover IDs.
 
 ## Available Tools
 
-**Workspace:** `inspect_workspace` (aggregates metadata, configuration, and peer/session IDs), `list_workspaces` (enumerates accessible workspaces), `search` (semantic search scoped by optional peer/session params), `get_metadata`, `set_metadata`
+**Workspace:** `list_workspaces` (id, metadata, created_at), `create_workspace` (get-or-create with optional metadata), `inspect_workspace` (aggregates metadata, configuration, and peer/session IDs), `search` (semantic search scoped by optional peer/session params), `get_metadata`, `set_metadata`
 
 **Peers:** `create_peer`, `list_peers`, `chat`, `get_peer_card`, `set_peer_card`, `get_peer_context`, `get_representation`
 
@@ -53,7 +46,7 @@ A Cloudflare Worker that implements the [Model Context Protocol (MCP)](https://m
 src/
   index.ts              # Worker entry point — parse config, delegate to MCP handler
   server.ts             # createServer() — registers all tools on an McpServer
-  config.ts             # HonchoConfig, parseConfig(), createClient()
+  config.ts             # HonchoConfig, parseConfig(), createClientFactory()
   types.ts              # ToolContext, result helpers
   tools/
     workspace.ts        # inspect, list, search, metadata
@@ -115,8 +108,7 @@ bun run tsc --noEmit
 
 ```bash
 bunx mcp-remote http://localhost:8787 \
-  --header "Authorization:Bearer <key>" \
-  --header "X-Honcho-User-Name:test"
+  --header "Authorization:Bearer <key>"
 ```
 
 ### Deploy

@@ -63,6 +63,22 @@ class AddMessagesAction(TestStep):
     messages: list[MessageItem]
 
 
+class CreateScopeAction(TestStep):
+    """Create a scope and optionally add member sessions.
+
+    Driven over raw HTTP rather than the SDK: scopes are a new API surface the
+    published SDK does not expose yet, and gating coverage on an SDK release
+    would leave the feature untested at exactly the point it needs testing.
+    """
+
+    step_type: Literal["create_scope"] = "create_scope"
+    scope_id: str = Field(..., description="Unprefixed scope name")
+    session_ids: list[str] = Field(
+        default_factory=list,
+        description="Existing sessions to add as members of the scope",
+    )
+
+
 # --- Wait Actions ---
 
 
@@ -133,7 +149,13 @@ class JsonMatchAssertion(Assertion):
 
 class QueryAction(TestStep):
     step_type: Literal["query"] = "query"
-    target: Literal["chat", "get_context", "get_peer_card", "get_representation"]
+    target: Literal[
+        "chat",
+        "get_context",
+        "get_peer_card",
+        "get_representation",
+        "workspace_chat",
+    ]
 
     session_id: str | None = None
 
@@ -148,6 +170,14 @@ class QueryAction(TestStep):
 
     # for chat - reasoning level
     reasoning_level: ReasoningLevel | None = None
+
+    # for chat - optional JSON Schema the response must conform to
+    response_format: dict[str, Any] | None = None
+
+    # Confine the read to one scope (observer swap on peer chat) or to the
+    # union of several scopes' member sessions. Peer-chat/representation/
+    # context go over raw HTTP; workspace_chat uses the SDK `scope` argument.
+    scope: str | list[str] | None = None
 
     assertions: list[
         LLMJudgeAssertion
@@ -171,6 +201,7 @@ class TestDefinition(BaseModel):
             | CreateSessionAction
             | AddMessageAction
             | AddMessagesAction
+            | CreateScopeAction
             | WaitAction
             | ScheduleDreamAction
             | QueryAction,

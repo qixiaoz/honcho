@@ -37,6 +37,7 @@ from tests.unified.schema import (
     AddMessageAction,
     AddMessagesAction,
     ContainsAssertion,
+    CreateScopeAction,
     CreateSessionAction,
     ExactMatchAssertion,
     JsonMatchAssertion,
@@ -119,6 +120,7 @@ async def save_results_to_s3(
         # Create comprehensive results object
         timestamp = datetime.now(timezone.utc).isoformat()
         github_run_id = os.getenv("GITHUB_RUN_ID", "local")
+        github_run_attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
         github_sha = os.getenv("GITHUB_SHA", "unknown")
         github_ref = os.getenv("GITHUB_REF_NAME", "unknown")
 
@@ -132,6 +134,7 @@ async def save_results_to_s3(
             },
             "metadata": {
                 "github_run_id": github_run_id,
+                "github_run_attempt": github_run_attempt,
                 "github_sha": github_sha,
                 "github_ref": github_ref,
             },
@@ -145,31 +148,59 @@ async def save_results_to_s3(
             ],
         }
 
+        # One "folder" per run: <prefix>/<date>/<run>/ holding results.json plus
+        # the reasoning-trace file(s), so a run's summary and full LLM I/O live together.
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         sha_short = github_sha[:7] if github_sha != "unknown" else "unknown"
-        ref_name = github_ref if github_ref != "unknown" else "unknown"
-        key = f"{s3_prefix}/{date_str}-{ref_name}-{sha_short}.json"
+        ref_slug = github_ref.replace("/", "-")  # branch names may contain "/"
+        run_slug = f"{ref_slug}-{sha_short}-{github_run_id}-{github_run_attempt}"
+        run_prefix = f"{s3_prefix}/{date_str}/{run_slug}"
+        results_key = f"{run_prefix}/results.json"
 
         s3_client = boto3.client("s3", region_name=aws_region)  # pyright: ignore
         s3_client.put_object(  # pyright: ignore
             Bucket=s3_bucket,
-            Key=key,
+            Key=results_key,
             Body=json.dumps(comprehensive_results, indent=2).encode("utf-8"),
             ContentType="application/json",
         )
+        logger.info(f"Saved test results to S3 key {results_key}")
+
+        # Upload the reasoning traces (full LLM/deriver I/O) captured this run. The
+        # API and deriver both append to REASONING_TRACES_FILE (file-locked). Use
+        # upload_file so large trace files stream via multipart instead of buffering.
+        traces_path_str = os.getenv("REASONING_TRACES_FILE")
+        if traces_path_str:
+            traces_path = Path(traces_path_str)
+            if traces_path.is_file() and traces_path.stat().st_size > 0:
+                traces_key = f"{run_prefix}/{traces_path.name}"
+                try:
+                    s3_client.upload_file(  # pyright: ignore
+                        str(traces_path),
+                        s3_bucket,
+                        traces_key,
+                        ExtraArgs={"ContentType": "application/x-ndjson"},
+                    )
+                    logger.info(f"Saved reasoning traces to S3 key {traces_key}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to upload reasoning traces: {e}", exc_info=True
+                    )
+            else:
+                logger.warning(
+                    f"REASONING_TRACES_FILE={traces_path} is missing or empty; no traces uploaded"
+                )
 
         try:
             url: str = s3_client.generate_presigned_url(  # pyright: ignore
                 "get_object",
-                Params={"Bucket": s3_bucket, "Key": key},
+                Params={"Bucket": s3_bucket, "Key": results_key},
                 ExpiresIn=259200,  # 3 days
             )
-            logger.info(f"Saved test results to s3://{s3_bucket}/{key}")
-            return url, key  # pyright: ignore
+            return url, results_key  # pyright: ignore
         except Exception as e:
             logger.warning(f"Could not generate S3 presigned URL: {e}")
-            logger.info(f"Saved test results to s3://{s3_bucket}/{key}")
-            return None, key
+            return None, results_key
 
     except Exception as e:
         logger.error(f"Failed to save results to S3: {e}", exc_info=True)
@@ -184,6 +215,38 @@ class UnifiedTestExecutor:
     ):
         self.client: Honcho = honcho_client
         self.anthropic: AsyncAnthropic | None = anthropic_client
+
+    # --- raw HTTP -----------------------------------------------------------
+    # Some surfaces (scopes, the `scope` read option) exist in the API before the
+    # published SDK exposes them. Calling them directly also tests the contract
+    # the SDK is generated from, so a wrong status or shape surfaces here instead
+    # of being masked by client-side validation.
+
+    @property
+    def workspace_id(self) -> str:
+        workspace_id = getattr(self.client, "workspace_id", None)
+        if not workspace_id:
+            raise ValueError("Honcho client has no workspace_id")
+        return str(workspace_id)
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Call a /v3 workspace-scoped path directly, raising on error status."""
+        url = f"{str(self.client.base_url).rstrip('/')}/v3/workspaces/{self.workspace_id}{path}"
+        # Carry the same credential the SDK resolved (from `HONCHO_API_KEY`, unless
+        # passed explicitly). The harness sets no AUTH vars of its own, so auth is
+        # off by default — but it inherits `AUTH_USE_AUTH` from the environment,
+        # and these raw calls are the only ones here that would not be authorized.
+        headers: dict[str, str] = dict(kwargs.pop("headers", None) or {})
+        api_key = getattr(getattr(self.client, "_http", None), "api_key", None)
+        if api_key:
+            headers.setdefault("Authorization", f"Bearer {api_key}")
+        async with httpx.AsyncClient(timeout=120.0) as raw:
+            response = await raw.request(method, url, headers=headers, **kwargs)
+        if response.is_error:
+            raise AssertionError(
+                f"{method} {path} failed: {response.status_code} {response.text[:400]}"
+            )
+        return response
 
     async def execute(self, test_def: TestDefinition, test_name: str) -> bool:
         logger.info(f"Starting test: {test_name}")
@@ -281,6 +344,15 @@ class UnifiedTestExecutor:
                 )
             await session.aio.add_messages(msgs)
 
+        elif isinstance(step, CreateScopeAction):
+            await self._request("POST", "/scopes", json={"id": step.scope_id})
+            if step.session_ids:
+                await self._request(
+                    "POST",
+                    f"/scopes/{step.scope_id}/sessions",
+                    json={"session_ids": step.session_ids},
+                )
+
         elif isinstance(step, WaitAction):
             if step.duration:
                 await asyncio.sleep(step.duration)
@@ -314,6 +386,20 @@ class UnifiedTestExecutor:
         raise TimeoutError("Deriver queue did not empty within timeout")
 
     async def perform_query(self, step: QueryAction) -> Any:
+        if step.target == "workspace_chat":
+            if step.input is None:
+                raise ValueError("input required for workspace_chat")
+            return await self.client.aio.chat(
+                step.input,
+                session=step.session_id,
+                reasoning_level=step.reasoning_level,
+                response_format=step.response_format,
+                scope=step.scope,
+            )
+
+        if step.scope is not None:
+            return await self._perform_scoped_query(step)
+
         if step.target == "chat":
             if not step.observer_peer_id:
                 raise ValueError("observer_peer_id required for chat")
@@ -327,6 +413,7 @@ class UnifiedTestExecutor:
                 session=step.session_id,
                 target=step.observed_peer_id,
                 reasoning_level=step.reasoning_level,
+                response_format=step.response_format,
             )
             return response
 
@@ -363,6 +450,60 @@ class UnifiedTestExecutor:
             return representation
 
         return None
+
+    async def _perform_scoped_query(self, step: QueryAction) -> Any:
+        """Run a `scope`-confined read over raw HTTP (no SDK parameter for it)."""
+        if step.target == "chat":
+            if not step.observer_peer_id:
+                raise ValueError("observer_peer_id required for chat")
+            if step.input is None:
+                raise ValueError("input required for chat")
+            body: dict[str, Any] = {"query": step.input, "scope": step.scope}
+            if step.session_id:
+                body["session_id"] = step.session_id
+            if step.observed_peer_id:
+                body["target"] = step.observed_peer_id
+            if step.reasoning_level:
+                body["reasoning_level"] = step.reasoning_level
+            response = await self._request(
+                "POST", f"/peers/{step.observer_peer_id}/chat", json=body
+            )
+            return response.json()["content"]
+
+        if step.target == "get_representation":
+            if not step.observer_peer_id:
+                raise ValueError("observer_peer_id required for get_representation")
+            body = {"scope": step.scope}
+            if step.observed_peer_id:
+                body["target"] = step.observed_peer_id
+            if step.input:
+                body["search_query"] = step.input
+            response = await self._request(
+                "POST", f"/peers/{step.observer_peer_id}/representation", json=body
+            )
+            return response.json()["representation"]
+
+        if step.target == "get_context":
+            if not step.session_id:
+                raise ValueError("session_id required for get_context")
+            if not step.observed_peer_id:
+                raise ValueError("observed_peer_id required for a scoped get_context")
+            # `scope` on session context takes a single scope name.
+            if isinstance(step.scope, list):
+                raise ValueError("get_context accepts a single scope, not a list")
+            params: dict[str, Any] = {
+                "scope": step.scope,
+                "peer_target": step.observed_peer_id,
+                "summary": str(step.summary).lower(),
+            }
+            if step.max_tokens is not None:
+                params["tokens"] = step.max_tokens
+            response = await self._request(
+                "GET", f"/sessions/{step.session_id}/context", params=params
+            )
+            return response.json()
+
+        raise ValueError(f"`scope` is not supported for target {step.target!r}")
 
     async def check_assertion(self, result: Any, assertion: Any):
         result_str = str(result)
@@ -496,7 +637,8 @@ class UnifiedTestRunner:
             AsyncAnthropic(api_key=self.api_key) if self.api_key else None
         )
 
-    async def run(self):
+    async def run(self) -> int:
+        """Run the suite and return the number of tests that did not pass."""
         try:
             # 1. Start Harness
             logger.info("Starting Honcho Harness...")
@@ -654,6 +796,8 @@ class UnifiedTestRunner:
 
                 await send_discord_message(discord_webhook_url, message)
 
+            return failed_count
+
         finally:
             # 7. Cleanup
             logger.info("Cleaning up harness...")
@@ -668,4 +812,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     runner = UnifiedTestRunner(Path(args.test_dir))
-    asyncio.run(runner.run())
+    sys.exit(1 if asyncio.run(runner.run()) else 0)

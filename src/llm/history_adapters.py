@@ -121,7 +121,7 @@ class OpenAIHistoryAdapter:
         }
         if result.reasoning_details:
             message["reasoning_details"] = result.reasoning_details
-        if result.thinking_content:
+        elif result.thinking_content:
             message["reasoning_content"] = result.thinking_content
         return message
 

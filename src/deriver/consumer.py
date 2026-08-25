@@ -8,6 +8,10 @@ from sqlalchemy import select
 from src import crud, models
 from src.dependencies import tracked_db
 from src.deriver.deriver import process_representation_tasks_batch
+from src.deriver.scope_backfill import (
+    process_scope_backfill,
+    process_scope_removal,
+)
 from src.dreamer import process_dream
 from src.exceptions import ResourceNotFoundException, ValidationException
 from src.models import Message
@@ -26,6 +30,8 @@ from src.utils.queue_payload import (
     DeletionPayload,
     DreamPayload,
     ReconcilerPayload,
+    ScopeBackfillPayload,
+    ScopeRemovalPayload,
     SummaryPayload,
     WebhookPayload,
 )
@@ -43,17 +49,20 @@ async def process_item(queue_item: models.QueueItem) -> None:
 
     # Handle reconciler first - it's the only task type that doesn't require workspace_name
     if task_type == "reconciler":
-        with sentry_sdk.start_transaction(name="process_reconciler_task", op="deriver"):
-            try:
-                validated = ReconcilerPayload(**queue_payload)
-            except ValidationError as e:
-                logger.error(
-                    "Invalid reconciler payload received: %s. Payload: %s",
-                    str(e),
-                    queue_payload,
-                )
-                raise ValueError(f"Invalid payload structure: {str(e)}") from e
-            await process_reconciler(validated)
+        # No top-level transaction here: reconciler tasks poll on a fixed
+        # interval and usually find no work. Tracing is started per-batch
+        # inside the reconciler only when actual work is found, so idle
+        # cycles don't consume Sentry tracing/profiling quota.
+        try:
+            validated = ReconcilerPayload(**queue_payload)
+        except ValidationError as e:
+            logger.error(
+                "Invalid reconciler payload received: %s. Payload: %s",
+                str(e),
+                queue_payload,
+            )
+            raise ValueError(f"Invalid payload structure: {str(e)}") from e
+        await process_reconciler(validated)
         return
 
     # All other task types require a workspace_name
@@ -147,6 +156,36 @@ async def process_item(queue_item: models.QueueItem) -> None:
                 raise ValueError(f"Invalid payload structure: {str(e)}") from e
             await process_deletion(validated, workspace_name)
 
+    elif task_type == "scope_backfill":
+        with sentry_sdk.start_transaction(
+            name="process_scope_backfill_task", op="deriver"
+        ):
+            try:
+                validated = ScopeBackfillPayload(**queue_payload)
+            except ValidationError as e:
+                logger.error(
+                    "Invalid scope_backfill payload received: %s. Payload: %s",
+                    str(e),
+                    queue_payload,
+                )
+                raise ValueError(f"Invalid payload structure: {str(e)}") from e
+            await process_scope_backfill(validated, workspace_name)
+
+    elif task_type == "scope_removal":
+        with sentry_sdk.start_transaction(
+            name="process_scope_removal_task", op="deriver"
+        ):
+            try:
+                validated = ScopeRemovalPayload(**queue_payload)
+            except ValidationError as e:
+                logger.error(
+                    "Invalid scope_removal payload received: %s. Payload: %s",
+                    str(e),
+                    queue_payload,
+                )
+                raise ValueError(f"Invalid payload structure: {str(e)}") from e
+            await process_scope_removal(validated, workspace_name)
+
     else:
         raise ValueError(f"Invalid task type: {task_type}")
 
@@ -173,7 +212,7 @@ async def process_representation_batch(
         queue_item_message_ids: Message IDs from queue items
         hit_batch_token_cap: whether the queue batcher clamped this batch to fit
         was_flush_enabled: snapshot of DERIVER.FLUSH_ENABLED at fetch time
-        batch_max_tokens: DERIVER.REPRESENTATION_BATCH_MAX_TOKENS snapshot
+        batch_max_tokens: DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS snapshot
     """
     if not messages or not messages[0]:
         logger.debug("process_representation_batch received no messages")

@@ -10,6 +10,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Reasoning level of a conclusion. "explicit" conclusions are extracted directly
+# from messages; the others are derived during dreaming.
+ConclusionLevel = Literal["explicit", "deductive", "inductive", "contradiction"]
+
 # ==============================================================================
 # Configuration Types
 # ==============================================================================
@@ -272,6 +276,7 @@ class SessionCreateParams(BaseModel):
     metadata: dict[str, Any] | None = None
     peers: dict[str, SessionPeerConfig] | None = None
     configuration: SessionConfiguration | None = None
+    scopes: list[str] | None = None
 
 
 class SessionUpdateParams(BaseModel):
@@ -289,6 +294,44 @@ class SessionListParams(BaseModel):
     model_config = ConfigDict(extra="forbid")  # pyright: ignore[reportUnannotatedClassAttribute]
 
     filters: dict[str, Any] | None = None
+
+
+# ==============================================================================
+# Scope Types
+# ==============================================================================
+
+
+class ScopeResponse(BaseModel):
+    """Scope API response."""
+
+    model_config = ConfigDict(populate_by_name=True)  # pyright: ignore[reportUnannotatedClassAttribute]
+
+    id: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime.datetime
+
+
+class ScopeBackfillJob(BaseModel):
+    """Backfill job state for one session in a scope.
+
+    ``docs_copied`` is present only once the backfill for that session completes.
+    """
+
+    model_config = ConfigDict(extra="ignore")  # pyright: ignore[reportUnannotatedClassAttribute]
+
+    state: Literal["pending", "completed", "failed"]
+    updated_at: datetime.datetime
+    docs_copied: int | None = None
+
+
+class ScopeStatusResponse(BaseModel):
+    """Scope backfill/reconciliation status API response.
+
+    ``backfill_status`` is keyed by session ID and only contains sessions that
+    have had a backfill enqueued.
+    """
+
+    backfill_status: dict[str, ScopeBackfillJob] = Field(default_factory=dict)
 
 
 # ==============================================================================
@@ -414,6 +457,7 @@ class ConclusionResponse(BaseModel):
     observer_id: str
     observed_id: str
     session_id: str | None = None
+    level: ConclusionLevel = "explicit"
     created_at: datetime.datetime
 
 
@@ -498,6 +542,7 @@ class DialecticParams(BaseModel):
     query: str = Field(min_length=1, max_length=10000)
     stream: bool = False
     reasoning_level: ReasoningLevel = "low"
+    response_format: dict[str, Any] | None = None
 
 
 class DialecticResponse(BaseModel):

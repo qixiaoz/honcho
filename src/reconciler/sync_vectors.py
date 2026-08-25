@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, cast
 
+import sentry_sdk
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
@@ -22,6 +23,7 @@ from src.config import settings
 from src.dependencies import tracked_db
 from src.embedding_client import embedding_client
 from src.exceptions import VectorStoreError
+from src.telemetry import prometheus_metrics
 from src.telemetry.events import EmbeddingCallPurpose
 from src.utils.types import embedding_call_purpose
 from src.vector_store import VectorRecord, VectorStore, get_external_vector_store
@@ -300,7 +302,9 @@ async def _sync_documents(
                 EmbeddingCallPurpose.VECTOR_SYNC.value,
                 parent_category="reconciliation",
             ):
-                new_embeddings = await embedding_client.simple_batch_embed(contents)
+                new_embeddings = await embedding_client.simple_batch_embed(
+                    contents, on_oversize="truncate"
+                )
 
             if len(new_embeddings) != len(docs_needing_embed):
                 logger.warning(
@@ -618,10 +622,13 @@ async def _reconcile_documents_batch(
         if not docs:
             return False
 
-        synced, failed = await _sync_documents(db, docs, external_vector_store)
-        metrics.documents_synced += synced
-        metrics.documents_failed += failed
-        await db.commit()
+        with sentry_sdk.start_transaction(
+            name="reconcile_documents_batch", op="reconciler"
+        ):
+            synced, failed = await _sync_documents(db, docs, external_vector_store)
+            metrics.documents_synced += synced
+            metrics.documents_failed += failed
+            await db.commit()
         return True
 
 
@@ -639,10 +646,15 @@ async def _reconcile_message_embeddings_batch(
         if not embs:
             return False
 
-        synced, failed = await _sync_message_embeddings(db, embs, external_vector_store)
-        metrics.message_embeddings_synced += synced
-        metrics.message_embeddings_failed += failed
-        await db.commit()
+        with sentry_sdk.start_transaction(
+            name="reconcile_message_embeddings_batch", op="reconciler"
+        ):
+            synced, failed = await _sync_message_embeddings(
+                db, embs, external_vector_store
+            )
+            metrics.message_embeddings_synced += synced
+            metrics.message_embeddings_failed += failed
+            await db.commit()
         return True
 
 
@@ -691,6 +703,42 @@ async def _cleanup_pgvector_batch(
         return True
 
 
+async def record_pending_embeddings_backlog() -> None:
+    """Set the pending-embeddings backlog gauge to the current count of
+    MessageEmbedding rows awaiting a vector (sync_state='pending')."""
+    # region ai
+    # Called from ``ReconcilerScheduler._scheduler_loop``, deliberately NOT from
+    # ``run_vector_reconciliation_cycle``: the cycle runs off the queue behind
+    # work-unit dedup, so exactly one deriver replica executes it. Driving the gauge
+    # from there would leave every other replica exporting a stale value — or, since
+    # this metric is zero-initialized, a confident permanent 0 it never measured. The
+    # count is a property of the database, not the process, so every replica must
+    # refresh it on its own timer for ``max()``/``avg()`` to mean anything.
+    #
+    # Cost: one COUNT per replica per scheduler interval (~5 min by default).
+    # ``ix_message_embeddings_sync_state_last_sync_at`` keeps the scan proportional to
+    # the pending backlog, not the whole table — which is not the same as cheap: after
+    # an embedding outage the backlog is exactly what is large. Still a small duty
+    # cycle, and the cost shrinks as the reconciler drains.
+    #
+    # Best-effort: a metrics/DB hiccup here must never break the scheduler loop.
+    # endregion
+    if not settings.METRICS.ENABLED:
+        return
+    try:
+        async with tracked_db("reconciler_pending_count", read_only=True) as db:
+            count = await db.scalar(
+                select(func.count())
+                .select_from(models.MessageEmbedding)
+                .where(models.MessageEmbedding.sync_state == "pending")
+            )
+        prometheus_metrics.set_message_embeddings_pending(count=count or 0)
+    except Exception:
+        logger.warning(
+            "Failed to record pending-embeddings backlog gauge", exc_info=True
+        )
+
+
 async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
     """
     Run a complete reconciliation cycle.
@@ -719,7 +767,7 @@ async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
 
             if not (embs_work or cleanup_work):
                 break
-        logger.info("Vector reconciliation cycle completed (pgvector mode)")
+        logger.debug("Vector reconciliation cycle completed (pgvector mode)")
         return metrics
 
     # External vector store mode - reconcile documents, embeddings, and cleanup
@@ -746,5 +794,5 @@ async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
             logger.debug("No work done, breaking reconciliation loop")
             break
 
-    logger.info("Vector reconciliation cycle completed")
+    logger.debug("Vector reconciliation cycle completed")
     return metrics

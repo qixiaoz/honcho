@@ -3,12 +3,50 @@ import type { HonchoHTTPClient } from './http/client'
 import { Page } from './pagination'
 import type { Session } from './session'
 import type {
+  ConclusionLevel,
   ConclusionResponse,
   PageResponse,
   RepresentationOptions,
   RepresentationResponse,
 } from './types/api'
 import { normalizeSearchQuery, RepresentationOptionsSchema } from './validation'
+
+/**
+ * Filter keys that define a conclusions view (the observer/observed peer pair).
+ * They are set from the view itself, so a caller must not pass them in `filters`.
+ */
+const VIEW_RESERVED_KEYS = [
+  'observer',
+  'observed',
+  'observer_id',
+  'observed_id',
+]
+
+/**
+ * Throw if `filters` contains keys managed by the conclusions view.
+ *
+ * The observer/observed peer pair (and, on `list`, the session) is fixed by the
+ * view, so letting a user filter override it would silently return data from a
+ * different pair than requested. Fail loud instead.
+ */
+function rejectReservedFilterKeys(
+  filters: Record<string, unknown> | undefined,
+  reserved: string[]
+): void {
+  if (!filters) return
+  const clash = reserved.filter((k) => k in filters).sort()
+  if (clash.length > 0) {
+    let guidance =
+      'Choose the peer pair via peer.conclusions / peer.conclusionsOf(target)'
+    if (reserved.includes('session') || reserved.includes('session_id')) {
+      guidance += '; use the session option to filter by session'
+    }
+    throw new Error(
+      `Filter key(s) ${clash.join(', ')} are managed by this conclusions view ` +
+        `and cannot be passed in filters. ${guidance}.`
+    )
+  }
+}
 
 /**
  * Parameters for creating a conclusion.
@@ -32,6 +70,12 @@ export class Conclusion {
   readonly observerId: string
   readonly observedId: string
   readonly sessionId: string | null
+  /**
+   * Reasoning level: 'explicit' conclusions are extracted directly from
+   * messages; 'deductive'/'inductive'/'contradiction' are derived during
+   * dreaming.
+   */
+  readonly level: ConclusionLevel
   readonly createdAt: string
 
   constructor(
@@ -40,13 +84,15 @@ export class Conclusion {
     observerId: string,
     observedId: string,
     sessionId: string | null,
-    createdAt: string
+    createdAt: string,
+    level: ConclusionLevel = 'explicit'
   ) {
     this.id = id
     this.content = content
     this.observerId = observerId
     this.observedId = observedId
     this.sessionId = sessionId
+    this.level = level
     this.createdAt = createdAt
   }
 
@@ -57,7 +103,8 @@ export class Conclusion {
       data.observer_id,
       data.observed_id,
       data.session_id,
-      data.created_at
+      data.created_at,
+      data.level
     )
   }
 
@@ -73,7 +120,7 @@ export class Conclusion {
 /**
  * Scoped access to conclusions for a specific observer/observed relationship.
  */
-export class ConclusionScope {
+export class ConclusionsView {
   private _http: HonchoHTTPClient
   private _ensureWorkspace: () => Promise<void>
   readonly workspaceId: string
@@ -176,20 +223,32 @@ export class ConclusionScope {
   // ===========================================================================
 
   /**
-   * List conclusions in this scope.
+   * List conclusions in this view.
    *
    * @param options - Optional configuration for the list request
    * @param options.page - Page number (1-indexed, default: 1)
    * @param options.size - Number of items per page (default: 50)
    * @param options.session - Optional session (ID string or Session object) to filter by
+   * @param options.filters - Optional additional filter criteria, merged with
+   *   this view's observer/observed (and session, if given). Supports the same
+   *   operators as other list endpoints — e.g. `{ level: 'explicit' }` to get
+   *   only conclusions extracted directly from messages (i.e. not derived during
+   *   dreaming). See
+   *   https://honcho.dev/docs/v3/documentation/features/advanced/using-filters
    * @returns Promise resolving to a Page of Conclusion objects
    */
   async list(options?: {
     page?: number
     size?: number
     session?: string | Session
+    filters?: Record<string, unknown>
     reverse?: boolean
   }): Promise<Page<Conclusion, ConclusionResponse>> {
+    rejectReservedFilterKeys(options?.filters, [
+      ...VIEW_RESERVED_KEYS,
+      'session',
+      'session_id',
+    ])
     const resolvedSessionId = options?.session
       ? typeof options.session === 'string'
         ? options.session
@@ -198,9 +257,8 @@ export class ConclusionScope {
     const filters: Record<string, unknown> = {
       observer_id: this.observer,
       observed_id: this.observed,
-    }
-    if (resolvedSessionId) {
-      filters.session_id = resolvedSessionId
+      ...(resolvedSessionId ? { session_id: resolvedSessionId } : {}),
+      ...options?.filters,
     }
     const reverse = options?.reverse
 
@@ -226,23 +284,33 @@ export class ConclusionScope {
   }
 
   /**
-   * Semantic search for conclusions in this scope.
+   * Semantic search for conclusions in this view.
+   *
+   * @param query - The search query string
+   * @param topK - Maximum number of results to return (default: 10)
+   * @param distance - Maximum cosine distance threshold (0.0-1.0)
+   * @param filters - Optional additional filter criteria, merged with this
+   *   view's observer/observed. Supports the same operators as the list
+   *   endpoint — e.g. `{ level: 'deductive' }` to search only conclusions
+   *   derived during dreaming. See
+   *   https://honcho.dev/docs/v3/documentation/features/advanced/using-filters
    */
   async query(
     query: string,
     topK: number = 10,
-    distance?: number
+    distance?: number,
+    filters?: Record<string, unknown>
   ): Promise<Conclusion[]> {
-    const filters: Record<string, unknown> = {
-      observer_id: this.observer,
-      observed_id: this.observed,
-    }
-
+    rejectReservedFilterKeys(filters, VIEW_RESERVED_KEYS)
     const response = await this._query({
       query,
       top_k: topK,
       distance,
-      filters,
+      filters: {
+        observer_id: this.observer,
+        observed_id: this.observed,
+        ...filters,
+      },
     })
 
     return (response ?? []).map((item) => Conclusion.fromApiResponse(item))
@@ -256,7 +324,7 @@ export class ConclusionScope {
   }
 
   /**
-   * Create conclusions in this scope.
+   * Create conclusions in this view.
    */
   async create(
     conclusions: ConclusionCreateParams | ConclusionCreateParams[]
@@ -283,7 +351,7 @@ export class ConclusionScope {
   }
 
   /**
-   * Get the computed representation for this scope.
+   * Get the computed representation for this view.
    */
   async representation(options?: RepresentationOptions): Promise<string> {
     const searchQuery = normalizeSearchQuery(options?.searchQuery)
@@ -307,6 +375,6 @@ export class ConclusionScope {
   }
 
   toString(): string {
-    return `ConclusionScope(workspaceId='${this.workspaceId}', observer='${this.observer}', observed='${this.observed}')`
+    return `ConclusionsView(workspaceId='${this.workspaceId}', observer='${this.observer}', observed='${this.observed}')`
   }
 }
