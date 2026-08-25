@@ -48,6 +48,7 @@ from src.vector_store import get_external_vector_store
 from .peer import (
     get_or_create_peers,
     get_peer,
+    precheck_peer_allowlist,
     reject_scope_peers,
     scope_peer_clause,
     scope_peer_names,
@@ -252,6 +253,12 @@ async def get_or_create_session(
             observer_count = count_observers_in_config(session.peer_names)
             if observer_count > settings.SESSION_OBSERVERS_LIMIT:
                 raise ObserverException(session.name, observer_count)
+            # Allowlist preflight: reject not-yet-existing peer names outside
+            # the workspace's ``allowed_ai_peers`` BEFORE the session insert
+            # (and before the workspace get-or-create below), so a rejected
+            # request performs no DB writes at all. The authoritative gate in
+            # get_or_create_peers covers the other entry points.
+            await precheck_peer_allowlist(db, workspace_name, session.peer_names)
 
         # Get or create workspace to ensure it exists
         ws_result = await get_or_create_workspace(

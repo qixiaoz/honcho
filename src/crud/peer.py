@@ -249,6 +249,63 @@ async def reject_scope_peers(
         raise ValidationException(f"Peer name(s) {offenders} are scopes. {action}")
 
 
+def _extract_allowed_ai_peers(ws_config: dict | None) -> list[str] | None:
+    """Pull ``allowed_ai_peers`` out of a workspace configuration dict.
+
+    ``None``/empty list means "unrestricted" (no allowlist configured).
+    """
+    if not ws_config:
+        return None
+    raw_allowed = ws_config.get("allowed_ai_peers")
+    if isinstance(raw_allowed, list):
+        return [str(x) for x in raw_allowed if isinstance(x, (str, int))]
+    return None
+
+
+async def precheck_peer_allowlist(
+    db: AsyncSession, workspace_name: str, peer_names: Collection[str]
+) -> None:
+    """Reject not-yet-existing peer names outside the workspace allowlist.
+
+    Read-only preflight used by session-create flows BEFORE any DB write
+    (upstream's ``get_or_create_session`` inserts the session row before
+    ``get_or_create_peers`` validates names, so the authoritative gate inside
+    ``get_or_create_peers`` fires too late to keep a rejected request
+    write-free). Already-existing peers are always allowed; an unset or empty
+    ``allowed_ai_peers`` leaves auto-creation unrestricted.
+
+    Raises:
+        PeerNotAllowedException: if any peer that would be auto-created is not
+            on the workspace's ``allowed_ai_peers`` allowlist
+    """
+    ws = (
+        await db.execute(
+            select(models.Workspace).where(models.Workspace.name == workspace_name)
+        )
+    ).scalar_one_or_none()
+    allowed = _extract_allowed_ai_peers(ws.configuration if ws is not None else None)
+    if not allowed:
+        return
+    existing = set(
+        (
+            await db.execute(
+                select(models.Peer.name)
+                .where(models.Peer.workspace_name == workspace_name)
+                .where(models.Peer.name.in_(list(peer_names)))
+            )
+        ).scalars()
+    )
+    rejected = sorted(
+        {name for name in peer_names if name not in existing and name not in allowed}
+    )
+    if rejected:
+        raise PeerNotAllowedException(
+            workspace_name=workspace_name,
+            rejected=rejected,
+            allowed=allowed,
+        )
+
+
 async def get_or_create_peers(
     db: AsyncSession,
     workspace_name: str,
@@ -286,12 +343,9 @@ async def get_or_create_peers(
     # the list will be rejected here so cross-workspace leaks (e.g. an
     # OpenCode plugin sending one profile's AI peer into another profile's
     # workspace) cannot silently grow a workspace's peer roster.
-    allowed_ai_peers: list[str] | None = None
-    if ws_result.resource is not None:
-        ws_config = ws_result.resource.configuration or {}
-        raw_allowed = ws_config.get("allowed_ai_peers")
-        if isinstance(raw_allowed, list):
-            allowed_ai_peers = [str(x) for x in raw_allowed if isinstance(x, (str, int))]
+    allowed_ai_peers = _extract_allowed_ai_peers(
+        ws_result.resource.configuration if ws_result.resource is not None else None
+    )
     peer_names = [p.name for p in peers]
     # Before the lookup: these values cannot match a stored row and would fail
     # inside the query itself rather than as a clean 422.
@@ -689,12 +743,18 @@ async def delete_peer(
     Raises:
         ResourceNotFoundException: if the peer does not exist
     """
-    # Verify peer exists
-    peer = await get_peer(
-        db,
-        workspace_name=workspace_name,
-        peer=schemas.PeerCreate(name=peer_name),
-    )
+    # Verify peer exists. Deliberately NOT routed through PeerCreate — the
+    # schema now enforces RESOURCE_NAME_PATTERN on names, but this is a lookup
+    # of a row that may predate that contract (legacy dotted names, squatters),
+    # and such peers must remain deletable.
+    peer = (
+        await db.execute(
+            select(models.Peer).where(
+                models.Peer.workspace_name == workspace_name,
+                models.Peer.name == peer_name,
+            )
+        )
+    ).scalar_one_or_none()
     if peer is None:
         raise ResourceNotFoundException(
             f"Peer {peer_name!r} not found in workspace {workspace_name!r}"

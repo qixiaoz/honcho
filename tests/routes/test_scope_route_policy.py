@@ -168,6 +168,10 @@ def _b_card_target(c: TestClient, ws: str, _s: str, p: str):
     )
 
 
+def _b_delete_peer_target(c: TestClient, ws: str, _s: str, p: str):
+    return c.delete(f"/v3/workspaces/{ws}/peers/{p}")
+
+
 def _b_conclusion_observed(c: TestClient, ws: str, _s: str, p: str):
     return c.post(
         f"/v3/workspaces/{ws}/conclusions",
@@ -355,6 +359,14 @@ POLICY: tuple[Case, ...] = (
         True,
         refuse_missing=True,
         build=_b_repr_target,
+    ),
+    Case(
+        "DELETE",
+        f"{_W}/peers/{{peer_id}}",
+        "peer_id",
+        True,
+        refuse_missing=True,
+        build=_b_delete_peer_target,
     ),
     Case(
         "GET",
@@ -744,9 +756,9 @@ def test_policy_entries_are_well_formed():
                     "status is 422 — missing_status is for the permissive cases"
                 )
             else:
-                assert (
-                    len(case.missing_reason.strip()) > 30
-                ), f"{case.key} tolerates a missing reserved name; say why"
+                assert len(case.missing_reason.strip()) > 30, (
+                    f"{case.key} tolerates a missing reserved name; say why"
+                )
                 assert case.missing_status, (
                     f"{case.key} tolerates a missing reserved name; name the exact "
                     "status(es) it should get, so a 5xx cannot satisfy the case"
@@ -757,9 +769,9 @@ def test_policy_entries_are_well_formed():
                 f"{case.key}: an allow case needs a builder and an expected "
                 "allow_status together, or neither"
             )
-            assert (
-                case.refuse_missing is None
-            ), f"{case.key}: refuse_missing applies to REFUSE cases only"
+            assert case.refuse_missing is None, (
+                f"{case.key}: refuse_missing applies to REFUSE cases only"
+            )
 
 
 _REFUSING = tuple(case for case in POLICY if case.refuse)
@@ -823,9 +835,9 @@ def test_refusing_position_rejects_a_real_scope(
     # A 422 alone proves nothing — a malformed body would also produce one.
     detail = result.text
     if case.schema_level:
-        assert (
-            "pattern" in detail
-        ), f"{case.key} expected a schema-level refusal; detail: {detail[:200]}"
+        assert "pattern" in detail, (
+            f"{case.key} expected a schema-level refusal; detail: {detail[:200]}"
+        )
     else:
         assert "scope" in detail.lower() and backing in detail, (
             f"{case.key} returned 422 but not because of the scope; "

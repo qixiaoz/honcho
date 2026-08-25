@@ -221,9 +221,19 @@ async def delete_peer(
     because Honcho's collection key is (observer, observed, workspace)
     and observations cannot be partially deleted.
     """
-    result = await crud.delete_peer(
-        db, workspace_name=workspace_id, peer_name=peer_id
+    # Strict variant: the peer being deleted is the subject, so a real scope
+    # AND a not-yet-existing reserved name are both refused — deleting a
+    # scope peer here would bypass the scopes routes' lifecycle management.
+    await crud.reject_scope_observed(
+        db,
+        workspace_id,
+        [peer_id],
+        action=(
+            "Scope peers are managed by the scopes routes; delete the scope "
+            "there instead of deleting the peer directly."
+        ),
     )
+    result = await crud.delete_peer(db, workspace_name=workspace_id, peer_name=peer_id)
     return {
         "peer": peer_id,
         "workspace": workspace_id,
