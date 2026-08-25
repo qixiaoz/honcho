@@ -137,6 +137,7 @@ __all__ = [
     "search_messages_temporal",
     "update_message",
     # Peer
+    "delete_peer",
     "get_or_create_peers",
     "get_peer",
     "reject_scope_observed",

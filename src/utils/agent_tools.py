@@ -1964,7 +1964,9 @@ async def _handle_search_memory(
             # Dream specialists need observations to reason about. Fall back to
             # recent observations (direct DB query, bypasses vector store).
             limit = min(_safe_int(tool_input.get("top_k"), 20), 20)
-            async with tracked_db("tool.search_memory.dream_fallback") as db:
+            async with tracked_db(
+                "tool.search_memory.dream_fallback", read_only=True
+            ) as db:
                 recent = await crud.query_documents_recent(
                     db=db,
                     workspace_name=ctx.workspace_name,
@@ -1972,14 +1974,20 @@ async def _handle_search_memory(
                     observed=ctx.observed,
                     limit=limit,
                 )
-                if recent:
-                    mem = Representation.from_documents(recent)
-                    repr_str = mem.str_with_ids() if ctx.include_observation_ids else str(mem)
-                    return (
-                        f"No vector search results for query '{query}', "
-                        f"but found {len(recent)} recent observations:\n\n{repr_str}"
-                    )
-            return f"No observations found for query '{query}'"
+            if recent:
+                recent_mem = Representation.from_documents(recent)
+                recent_str = (
+                    recent_mem.str_with_ids()
+                    if ctx.include_observation_ids
+                    else str(recent_mem)
+                )
+                return ToolResult(
+                    content=(
+                        f"No vector search results for query '{query}', but found "
+                        f"{len(recent)} recent observations:\n\n{recent_str}"
+                    ),
+                    metadata={**zero_hit_meta, "results_count": len(recent)},
+                )
         return ToolResult(
             content=f"No observations found for query '{query}'",
             metadata=zero_hit_meta,
